@@ -1,0 +1,51 @@
+From 451886e47b27186adb59cc4be971d54b5f626c6a Mon Sep 17 00:00:00 2001
+From: Agarwal Ashish <ashishka@codeaurora.org>
+Date: Tue, 10 Dec 2013 16:57:10 +0530
+Subject: [PATCH] Revert "wlan: Fix race condition for reliable delivery of
+ action frames."
+
+This reverts commit 5ceca36b86344ce120b8fa4b441c4d7081f1fc45.
+This fix will notify supplicant about cancel remain on channel,
+but in host a new remain on channel will be started.
+Supplicant will come out of listen state and can send new remain
+on channel event again. It's always better to tell supplicant about
+all remain on channel event.
+
+CRs-Fixed: 586753
+Change-Id: I08fe57596083dc3e4fc6c2ea69f0475f57c560e9
+---
+ CORE/HDD/src/wlan_hdd_p2p.c | 11 +----------
+ 1 file changed, 1 insertion(+), 10 deletions(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_p2p.c b/CORE/HDD/src/wlan_hdd_p2p.c
+index b3451de..749c401 100644
+--- a/CORE/HDD/src/wlan_hdd_p2p.c
++++ b/CORE/HDD/src/wlan_hdd_p2p.c
+@@ -732,7 +732,7 @@ int wlan_hdd_action( struct wiphy *wiphy, struct net_device *dev,
+             extendedWait = (tANI_U16)wait;
+             goto send_frame;
+         }
+-        remain_on_channel:
++
+         INIT_COMPLETION(pAdapter->offchannel_tx_event);
+ 
+         status = wlan_hdd_request_remain_on_channel(wiphy, dev,
+@@ -801,15 +801,6 @@ int wlan_hdd_action( struct wiphy *wiphy, struct net_device *dev,
+ #endif
+             *cookie = (tANI_U32) cfgState->buf;
+             cfgState->action_cookie = *cookie;
+-            /*There is race between expiration of remain on channel
+-              in driver and also sending an action frame in wlan_hdd_action.
+-              As the remain on chan context is NULL here , which means
+-              LIM remain on channel timer expired and
+-              wlan_hdd_remain_on_channel_callback has cleared
+-              cfgState->remain_on_chan_ctx to NULL so let's
+-              do a fresh remain on channel.
+-            */
+-            goto remain_on_channel;
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
+         }
+ #endif
+-- 
+1.8.2.1
+
