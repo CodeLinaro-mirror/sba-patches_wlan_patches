@@ -1,0 +1,1593 @@
+From 5c631e5ebf0595fe09afab428e8177f37d6a4d3c Mon Sep 17 00:00:00 2001
+From: Srinivas Girigowda <sgirigow@qca.qualcomm.com>
+Date: Sun, 10 Nov 2013 16:37:38 -0800
+Subject: [PATCH] wlan: ccx upload: Support ccx beacon report
+
+This is to provide support for CCX radio measument beacon report.
+Summary of changes include:
+1. Support for CCXBEACONREQ device private command to receive
+   measurement request IE information.
+2. Driver initiates scan and return the BSSID information using
+   IWEVCUSTOM event supporting 4 BSSID info per channel.
+3. Fix for scan type and duration getting over-written with the
+   last channel scan type and duration.
+4. IWEVCUSTOM has limitation of 256 bytes of event data, hence fill-in
+   only the mandatory IEs in the beacon report as per the spec.
+
+Change-Id: If0324b1732ea537f64a48c22c5e702c49356504e
+CRs-Fixed: 573479
+---
+ CORE/HDD/src/wlan_hdd_assoc.c               | 150 ++++++++++++-
+ CORE/HDD/src/wlan_hdd_main.c                | 159 ++++++++++++-
+ CORE/MAC/inc/aniSystemDefs.h                |  14 ++
+ CORE/MAC/inc/sirApi.h                       |  19 +-
+ CORE/MAC/inc/sirMacProtDef.h                |  86 ++++++-
+ CORE/MAC/src/include/parserApi.h            |  32 +++
+ CORE/MAC/src/include/sirParams.h            |   1 +
+ CORE/MAC/src/pe/include/rrmGlobal.h         |   9 +-
+ CORE/MAC/src/pe/rrm/rrmApi.c                |  11 +-
+ CORE/SME/inc/csrApi.h                       |  17 ++
+ CORE/SME/inc/smeRrmInternal.h               |   8 +-
+ CORE/SME/inc/sme_Api.h                      |  11 +
+ CORE/SME/inc/sme_RrmApi.h                   |   2 +-
+ CORE/SME/src/rrm/sme_rrm.c                  | 336 +++++++++++++++++++++-------
+ CORE/SME/src/sme_common/sme_Api.c           |  51 +++++
+ CORE/SYS/legacy/src/utils/inc/utilsParser.h |   1 +
+ CORE/SYS/legacy/src/utils/src/parserApi.c   | 196 ++++++++++++++++
+ CORE/SYS/legacy/src/utils/src/utilsParser.c |  10 +
+ 18 files changed, 1010 insertions(+), 103 deletions(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_assoc.c b/CORE/HDD/src/wlan_hdd_assoc.c
+index d30ad6d..b5872dc 100644
+--- a/CORE/HDD/src/wlan_hdd_assoc.c
++++ b/CORE/HDD/src/wlan_hdd_assoc.c
+@@ -131,6 +131,7 @@ static void hdd_indicateTsmIe(hdd_adapter_t *pAdapter, tANI_U8 tid,
+                             tANI_U16 measInterval );
+ static void hdd_indicateCckmPreAuth(hdd_adapter_t *pAdapter, tCsrRoamInfo *pRoamInfo);
+ static void hdd_indicateCcxAdjApRepInd(hdd_adapter_t *pAdapter, tCsrRoamInfo *pRoamInfo);
++static void hdd_indicateCcxBcnReportInd(const hdd_adapter_t *pAdapter, const tCsrRoamInfo *pRoamInfo);
+ 
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ 
+@@ -2671,6 +2672,12 @@ eHalStatus hdd_smeRoamCallback( void *pContext, tCsrRoamInfo *pRoamInfo, tANI_U3
+              hdd_indicateCcxAdjApRepInd(pAdapter, pRoamInfo);
+              break;
+          }
++
++       case eCSR_ROAM_CCX_BCN_REPORT_IND:
++         {
++            hdd_indicateCcxBcnReportInd(pAdapter, pRoamInfo);
++            break;
++         }
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+         default:
+             break;
+@@ -3895,12 +3902,10 @@ void hdd_indicateCckmPreAuth(hdd_adapter_t *pAdapter, tCsrRoamInfo *pRoamInfo)
+     pos += WNI_CFG_BSSID_LEN;
+     freeBytes -= WNI_CFG_BSSID_LEN;
+ 
+-    snprintf(pos, freeBytes, " %lu:%lu", pRoamInfo->timestamp[0], pRoamInfo->timestamp[1]);
++    snprintf(pos, freeBytes, " %u:%u", pRoamInfo->timestamp[0], pRoamInfo->timestamp[1]);
+ 
+     wrqu.data.pointer = buf;
+     wrqu.data.length = strlen(buf);
+-    hddLog(VOS_TRACE_LEVEL_ERROR, "Event data len(%d) data(%s)",
+-                                     strlen(buf), buf);
+ 
+     // send the event
+     wireless_send_event(pAdapter->dev, IWEVCUSTOM, &wrqu, buf);
+@@ -3929,5 +3934,144 @@ void hdd_indicateCcxAdjApRepInd(hdd_adapter_t *pAdapter, tCsrRoamInfo *pRoamInfo
+     wireless_send_event(pAdapter->dev, IWEVCUSTOM, &wrqu, buf);
+ }
+ 
++void hdd_indicateCcxBcnReportInd(const hdd_adapter_t *pAdapter,
++                                 const tCsrRoamInfo *pRoamInfo)
++{
++    union iwreq_data wrqu;
++    char buf[IW_CUSTOM_MAX + 1];
++    char *pos = buf;
++    int nBytes = 0, freeBytes = IW_CUSTOM_MAX;
++    tANI_U8 i = 0, len = 0;
++    tANI_U8 tot_bcn_ieLen = 0;  /* total size of the beacon report data */
++    tANI_U8 lastSent = 0, sendBss = 0;
++    int bcnRepFieldSize = sizeof(pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[0].bcnReportFields);
++
++    if ((NULL == pAdapter) || (NULL == pRoamInfo))
++        return;
++
++    /* Custom event can pass maximum of 256 bytes of data,
++       based on the IE len we need to identify how many BSS info can
++       be filled in to custom event data */
++    /*
++       meas_tok<sp>flag<sp>no_of_bss<sp>tot_bcn_ie_len bcn_rep_data
++         bcn_rep_data will have bcn_rep_fields,ie_len,ie without any spaces
++         CCXBCNREP=meas_tok<sp>flag<sp>no_of_bss<sp>tot_bcn_ie_len = 18 bytes
++    */
++
++    if ((pRoamInfo->pCcxBcnReportRsp->flag >> 1) && (!pRoamInfo->pCcxBcnReportRsp->numBss))
++    {
++        hddLog(VOS_TRACE_LEVEL_INFO, "Measurement Done but no scan results");
++        /* If the measurement is none and no scan results found,
++            indicate the supplicant about measurement done */
++        memset(&wrqu, '\0', sizeof(wrqu));
++        memset(buf, '\0', sizeof(buf));
++
++        hddLog(VOS_TRACE_LEVEL_INFO, "CCXBCNREP=%d %d %d %d",
++            pRoamInfo->pCcxBcnReportRsp->measurementToken, pRoamInfo->pCcxBcnReportRsp->flag,
++            pRoamInfo->pCcxBcnReportRsp->numBss, tot_bcn_ieLen);
++
++        nBytes = snprintf(pos, freeBytes, "CCXBCNREP=%d %d %d",
++            pRoamInfo->pCcxBcnReportRsp->measurementToken, pRoamInfo->pCcxBcnReportRsp->flag,
++            pRoamInfo->pCcxBcnReportRsp->numBss);
++
++        wrqu.data.pointer = buf;
++        wrqu.data.length = strlen(buf);
++        // send the event
++        wireless_send_event(pAdapter->dev, IWEVCUSTOM, &wrqu, buf);
++    }
++    else
++    {
++        while (lastSent < pRoamInfo->pCcxBcnReportRsp->numBss)
++        {
++            memset(&wrqu, '\0', sizeof(wrqu));
++            memset(buf, '\0', sizeof(buf));
++            tot_bcn_ieLen = 0;
++            sendBss = 0;
++            pos = buf;
++            freeBytes = IW_CUSTOM_MAX;
++
++            for (i = lastSent; i < pRoamInfo->pCcxBcnReportRsp->numBss; i++)
++            {
++                len = bcnRepFieldSize + 1 + pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i].ieLen;
++                if ((len + tot_bcn_ieLen) > (IW_CUSTOM_MAX - 18))
++                {
++                    break;
++                }
++                tot_bcn_ieLen += len;
++                sendBss++;
++                hddLog(VOS_TRACE_LEVEL_INFO, "i(%d) sizeof bcnReportFields(%d)"
++                             "IeLength(%d) Length of Ie(%d) totLen(%d)",
++                              i, bcnRepFieldSize, 1,
++                              pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i].ieLen,
++                              tot_bcn_ieLen);
++            }
++
++            hddLog(VOS_TRACE_LEVEL_INFO, "Sending %d BSS Info", sendBss);
++            hddLog(VOS_TRACE_LEVEL_INFO, "CCXBCNREP=%d %d %d %d",
++                pRoamInfo->pCcxBcnReportRsp->measurementToken, pRoamInfo->pCcxBcnReportRsp->flag,
++                pRoamInfo->pCcxBcnReportRsp->numBss, tot_bcn_ieLen);
++
++            nBytes = snprintf(pos, freeBytes, "CCXBCNREP=%d %d %d ",
++                pRoamInfo->pCcxBcnReportRsp->measurementToken, pRoamInfo->pCcxBcnReportRsp->flag,
++                pRoamInfo->pCcxBcnReportRsp->numBss);
++            pos += nBytes;
++            freeBytes -= nBytes;
++
++            /* Copy total Beacon report data length */
++            vos_mem_copy(pos, (char*)&tot_bcn_ieLen, sizeof(tot_bcn_ieLen));
++            pos += sizeof(tot_bcn_ieLen);
++            freeBytes -= sizeof(tot_bcn_ieLen);
++
++            for (i = 0; i < sendBss; i++)
++            {
++                hddLog(VOS_TRACE_LEVEL_INFO, "ChanNum(%d) Spare(%d) MeasDuration(%d)"
++                       " PhyType(%d) RecvSigPower(%d) ParentTSF(%lu)"
++                       " TargetTSF[0](%lu) TargetTSF[1](%lu) BeaconInterval(%u)"
++                       " CapabilityInfo(%d) BSSID(%02X:%02X:%02X:%02X:%02X:%02X)",
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.ChanNum,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.Spare,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.MeasDuration,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.PhyType,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.RecvSigPower,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.ParentTsf,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.TargetTsf[0],
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.TargetTsf[1],
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.BcnInterval,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.CapabilityInfo,
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.Bssid[0],
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.Bssid[1],
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.Bssid[2],
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.Bssid[3],
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.Bssid[4],
++                        pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields.Bssid[5]);
++
++                /* bcn report fields are copied */
++                len = sizeof(pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields);
++                vos_mem_copy(pos, (char*)&pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].bcnReportFields, len);
++                pos += len;
++                freeBytes -= len;
++
++                /* Add 1 byte of ie len */
++                len = pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].ieLen;
++                vos_mem_copy(pos, (char*)&len, sizeof(len));
++                pos += sizeof(len);
++                freeBytes -= sizeof(len);
++
++                /* copy IE from scan results */
++                vos_mem_copy(pos, (char*)pRoamInfo->pCcxBcnReportRsp->bcnRepBssInfo[i+lastSent].pBuf, len);
++                pos += len;
++                freeBytes -= len;
++            }
++
++            wrqu.data.pointer = buf;
++            wrqu.data.length = strlen(buf);
++
++            // send the event
++            wireless_send_event(pAdapter->dev, IWEVCUSTOM, &wrqu, buf);
++            lastSent += sendBss;
++        }
++    }
++}
++
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ 
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index 0b29423..b966b2d 100644
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -174,6 +174,8 @@ static int wlan_hdd_inited;
+ #define TID_MAX_VALUE 15
+ static VOS_STATUS  hdd_get_tsm_stats(hdd_adapter_t *pAdapter, const tANI_U8 tid,
+                                          tAniTrafStrmMetrics* pTsmMetrics);
++static VOS_STATUS hdd_parse_ccx_beacon_req(tANI_U8 *pValue,
++                                     tCsrCcxBeaconReq *pCcxBcnReq);
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ 
+ /*
+@@ -2325,7 +2327,7 @@ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+            /* Output TSM stats is of the format
+                    GETTSMSTATS [PktQueueDly] [PktQueueDlyHist[0]]:[PktQueueDlyHist[1]] ...[RoamingDly]
+                    eg., GETTSMSTATS 10 1:0:0:161 20 1 17 8 39800 */
+-           len = scnprintf(extra, sizeof(extra), "%s %d %d:%d:%d:%d %lu %d %d %d %d", command,
++           len = scnprintf(extra, sizeof(extra), "%s %d %d:%d:%d:%d %u %d %d %d %d", command,
+                   tsmMetrics.UplinkPktQueueDly, tsmMetrics.UplinkPktQueueDlyHist[0],
+                   tsmMetrics.UplinkPktQueueDlyHist[1], tsmMetrics.UplinkPktQueueDlyHist[2],
+                   tsmMetrics.UplinkPktQueueDlyHist[3], tsmMetrics.UplinkPktTxDly,
+@@ -2374,6 +2376,22 @@ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+                vos_mem_free(cckmIe);
+            }
+        }
++       else if (strncmp(command, "CCXBEACONREQ", 12) == 0)
++       {
++           tANI_U8 *value = command;
++           tCsrCcxBeaconReq ccxBcnReq;
++           eHalStatus status = eHAL_STATUS_SUCCESS;
++           status = hdd_parse_ccx_beacon_req(value, &ccxBcnReq);
++           if (eHAL_STATUS_SUCCESS != status)
++           {
++               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
++                  "%s: Failed to parse ccx beacon req", __func__);
++               ret = -EINVAL;
++               goto exit;
++           }
++
++           sme_SetCcxBeaconRequest((tHalHandle)(pHddCtx->hHal), pAdapter->sessionId, &ccxBcnReq);
++       }
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+        else {
+            hddLog( VOS_TRACE_LEVEL_WARN, "%s: Unsupported GUI command %s",
+@@ -2392,6 +2410,145 @@ exit:
+ 
+ 
+ #if defined(FEATURE_WLAN_CCX) && defined(FEATURE_WLAN_CCX_UPLOAD)
++/**---------------------------------------------------------------------------
++
++  \brief hdd_parse_ccx_beacon_req() - Parse ccx beacon request
++
++  This function parses the ccx beacon request passed in the format
++  CCXBEACONREQ<space><Number of fields><space><Measurement token>
++  <space>Channel 1<space>Scan Mode <space>Meas Duration<space>Channel N
++  <space>Scan Mode N<space>Meas Duration N
++  if the Number of bcn req fields (N) does not match with the actual number of fields passed
++  then take N.
++  <Meas Token><Channel><Scan Mode> and <Meas Duration> are treated as one pair
++  For example, CCXBEACONREQ 2 1 1 1 30 2 44 0 40.
++  This function does not take care of removing duplicate channels from the list
++
++  \param  - pValue Pointer to data
++  \param  - pCcxBcnReq output pointer to store parsed ie information
++
++  \return - 0 for success non-zero for failure
++
++  --------------------------------------------------------------------------*/
++static VOS_STATUS hdd_parse_ccx_beacon_req(tANI_U8 *pValue,
++                                     tCsrCcxBeaconReq *pCcxBcnReq)
++{
++    tANI_U8 *inPtr = pValue;
++    int tempInt = 0;
++    int j = 0, i = 0, v = 0;
++    char buf[32];
++
++    inPtr = strnchr(pValue, strlen(pValue), SPACE_ASCII_VALUE);
++    /*no argument after the command*/
++    if (NULL == inPtr)
++    {
++        return -EINVAL;
++    }
++    /*no space after the command*/
++    else if (SPACE_ASCII_VALUE != *inPtr)
++    {
++        return -EINVAL;
++    }
++
++    /*removing empty spaces*/
++    while ((SPACE_ASCII_VALUE  == *inPtr) && ('\0' !=  *inPtr)) inPtr++;
++
++    /*no argument followed by spaces*/
++    if ('\0' == *inPtr) return -EINVAL;
++
++    /*getting the first argument ie measurement token*/
++    v = sscanf(inPtr, "%32s ", buf);
++    if (1 != v) return -EINVAL;
++
++    v = kstrtos32(buf, 10, &tempInt);
++    if ( v < 0) return -EINVAL;
++
++    pCcxBcnReq->numBcnReqIe = tempInt;
++
++    VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO_HIGH,
++               "Number of Bcn Req Ie fields(%d)", pCcxBcnReq->numBcnReqIe);
++
++    for (j = 0; j < (pCcxBcnReq->numBcnReqIe); j++)
++    {
++        for (i = 0; i < 4; i++)
++        {
++            /*inPtr pointing to the beginning of first space after number of ie fields*/
++            inPtr = strpbrk( inPtr, " " );
++            /*no ie data after the number of ie fields argument*/
++            if (NULL == inPtr) return -EINVAL;
++
++            /*removing empty space*/
++            while ((SPACE_ASCII_VALUE == *inPtr) && ('\0' != *inPtr)) inPtr++;
++
++            /*no ie data after the number of ie fields argument and spaces*/
++            if ( '\0' == *inPtr ) return -EINVAL;
++
++            v = sscanf(inPtr, "%32s ", buf);
++            if (1 != v) return -EINVAL;
++
++            v = kstrtos32(buf, 10, &tempInt);
++            if (v < 0) return -EINVAL;
++
++            switch (i)
++            {
++                case 0:  /* Measurement token */
++                if (tempInt <= 0)
++                {
++                   VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
++                             "Invalid Measurement Token(%d)", tempInt);
++                   return -EINVAL;
++                }
++                pCcxBcnReq->bcnReq[j].measurementToken = tempInt;
++                break;
++
++                case 1:  /* Channel number */
++                if ((tempInt <= 0) ||
++                    (tempInt > WNI_CFG_CURRENT_CHANNEL_STAMAX))
++                {
++                   VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
++                             "Invalid Channel Number(%d)", tempInt);
++                   return -EINVAL;
++                }
++                pCcxBcnReq->bcnReq[j].channel = tempInt;
++                break;
++
++                case 2:  /* Scan mode */
++                if ((tempInt < 0) || (tempInt > 2))
++                {
++                   VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
++                             "Invalid Scan Mode(%d) Expected{0|1|2}", tempInt);
++                   return -EINVAL;
++                }
++                pCcxBcnReq->bcnReq[j].scanMode= tempInt;
++                break;
++
++                case 3:  /* Measurement duration */
++                if (tempInt <= 0)
++                {
++                   VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
++                             "Invalid Measurement Duration(%d)", tempInt);
++                   return -EINVAL;
++                }
++                pCcxBcnReq->bcnReq[j].measurementDuration = tempInt;
++                break;
++            }
++        }
++    }
++
++    for (j = 0; j < pCcxBcnReq->numBcnReqIe; j++)
++    {
++        VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
++                   "Index(%d) Measurement Token(%lu)Channel(%lu) Scan Mode(%lu) Measurement Duration(%lu)\n",
++                   j,
++                   pCcxBcnReq->bcnReq[j].measurementToken,
++                   pCcxBcnReq->bcnReq[j].channel,
++                   pCcxBcnReq->bcnReq[j].scanMode,
++                   pCcxBcnReq->bcnReq[j].measurementDuration);
++    }
++
++    return VOS_STATUS_SUCCESS;
++}
++
+ static void hdd_GetTsmStatsCB( tAniTrafStrmMetrics tsmMetrics, const tANI_U32 staId, void *pContext )
+ {
+    struct statsContext *pStatsContext = NULL;
+diff --git a/CORE/MAC/inc/aniSystemDefs.h b/CORE/MAC/inc/aniSystemDefs.h
+index ea88001..fb0d26c 100644
+--- a/CORE/MAC/inc/aniSystemDefs.h
++++ b/CORE/MAC/inc/aniSystemDefs.h
+@@ -257,6 +257,20 @@ typedef __ani_attr_pre_packed struct sTrafStrmMetrics
+ } __ani_attr_packed tTrafStrmMetrics, *tpTrafStrmMetrics;
+ 
+ 
++typedef __ani_attr_pre_packed struct sBcnReportFields
++{
++    tANI_U8       ChanNum;
++    tANI_U8       Spare;
++    tANI_U16      MeasDuration;
++    tANI_U8       PhyType;
++    tANI_U8       RecvSigPower;
++    tSirMacAddr   Bssid;
++    tANI_U32      ParentTsf;
++    tANI_U32      TargetTsf[2];
++    tANI_U16      BcnInterval;
++    tANI_U16      CapabilityInfo;
++} __ani_attr_packed tBcnReportFields, *tpBcnReportFields;
++
+ 
+ #endif /* __ANI_SYSTEM_DEFS_H */
+ 
+diff --git a/CORE/MAC/inc/sirApi.h b/CORE/MAC/inc/sirApi.h
+index 1ef17f4..76bb63b 100644
+--- a/CORE/MAC/inc/sirApi.h
++++ b/CORE/MAC/inc/sirApi.h
+@@ -94,6 +94,7 @@
+  *array of 166 is required.
+  */
+ #define SIR_MAX_24G_5G_CHANNEL_RANGE      166
++#define SIR_BCN_REPORT_MAX_BSS_DESC       4
+ 
+ 
+ 
+@@ -728,7 +729,7 @@ typedef struct sSirSmeStartBssRsp
+ typedef struct sSirChannelList
+ {
+     tANI_U8          numChannels;
+-    tANI_U8          channelNumber[1];
++    tANI_U8          channelNumber[SIR_CCX_MAX_MEAS_IE_REQS];
+ } tSirChannelList, *tpSirChannelList;
+ 
+ typedef struct sSirDFSChannelList
+@@ -2183,6 +2184,22 @@ typedef struct sAniGetTsmStatsRsp
+     tAniTrafStrmMetrics tsmMetrics;
+     void               *tsmStatsReq; //tsm stats request backup
+ } tAniGetTsmStatsRsp, *tpAniGetTsmStatsRsp;
++
++typedef struct sSirCcxBcnReportBssInfo
++{
++    tBcnReportFields  bcnReportFields;
++    tANI_U8           ieLen;
++    tANI_U8           *pBuf;
++} tSirCcxBcnReportBssInfo, *tpSirCcxBcnReportBssInfo;
++
++typedef struct sSirCcxBcnReportRsp
++{
++    tANI_U16    measurementToken;
++    tANI_U8     flag;     /* Flag to report measurement done and more data */
++    tANI_U8     numBss;
++    tSirCcxBcnReportBssInfo bcnRepBssInfo[SIR_BCN_REPORT_MAX_BSS_DESC];
++} tSirCcxBcnReportRsp, *tpSirCcxBcnReportRsp;
++
+ #endif /* FEATURE_WLAN_CCX || FEATURE_WLAN_CCX_UPLOAD */
+ 
+ /* Change country code request MSG structure */
+diff --git a/CORE/MAC/inc/sirMacProtDef.h b/CORE/MAC/inc/sirMacProtDef.h
+index 609812a..3987822 100644
+--- a/CORE/MAC/inc/sirMacProtDef.h
++++ b/CORE/MAC/inc/sirMacProtDef.h
+@@ -394,7 +394,11 @@
+ #define SIR_MAC_EXTENDED_RATE_EID      50
+ #define SIR_MAC_EXTENDED_RATE_EID_MIN      0
+ #define SIR_MAC_EXTENDED_RATE_EID_MAX      255
+-// reserved       51-220
++// reserved       51-69
++#define SIR_MAC_RM_ENABLED_CAPABILITY_EID      70
++#define SIR_MAC_RM_ENABLED_CAPABILITY_EID_MIN  5
++#define SIR_MAC_RM_ENABLED_CAPABILITY_EID_MAX  5
++// reserved       71-220
+ #define SIR_MAC_WPA_EID                221
+ #define SIR_MAC_WPA_EID_MIN                0
+ #define SIR_MAC_WPA_EID_MAX                255
+@@ -1084,6 +1088,86 @@ typedef __ani_attr_pre_packed struct sSirMacWpaInfo
+     tANI_U8        info[SIR_MAC_MAX_IE_LENGTH];
+ } __ani_attr_packed tSirMacWpaInfo, *tpSirMacWpaInfo, tSirMacRsnInfo, *tpSirMacRsnInfo;
+ 
++typedef __ani_attr_pre_packed struct sSirMacFHParamSet
++{
++    tANI_U16     dwellTime;
++    tANI_U8      hopSet;
++    tANI_U8      hopPattern;
++    tANI_U8      hopIndex;
++} tSirMacFHParamSet, *tpSirMacFHParamSet;
++
++typedef __ani_attr_pre_packed struct sSirMacIBSSParams
++{
++    tANI_U16     atim;
++} tSirMacIBSSParams, *tpSirMacIBSSParams;
++
++typedef __ani_attr_pre_packed struct sSirMacRRMEnabledCap
++{
++#ifndef ANI_LITTLE_BIT_ENDIAN
++    tANI_U8                reserved: 6;
++    tANI_U8      AntennaInformation: 1;
++    tANI_U8       BSSAvailAdmission: 1;
++    tANI_U8       BssAvgAccessDelay: 1;
++    tANI_U8         RSNIMeasurement: 1;
++    tANI_U8         RCPIMeasurement: 1;
++    tANI_U8       NeighborTSFOffset: 1;
++    tANI_U8 MeasurementPilotEnabled: 1;
++    tANI_U8        MeasurementPilot: 3;
++    tANI_U8      nonOperatinChanMax: 3;
++    tANI_U8        operatingChanMax: 3;
++    tANI_U8           RRMMIBEnabled: 1;
++    tANI_U8            APChanReport: 1;
++    tANI_U8            triggeredTCM: 1;
++    tANI_U8           TCMCapability: 1;
++    tANI_U8              LCIAzimuth: 1;
++    tANI_U8          LCIMeasurement: 1;
++    tANI_U8              statistics: 1;
++    tANI_U8          NoiseHistogram: 1;
++    tANI_U8             ChannelLoad: 1;
++    tANI_U8        FrameMeasurement: 1;
++    tANI_U8           BeaconRepCond: 1;
++    tANI_U8             BeaconTable: 1;
++    tANI_U8            BeaconActive: 1;
++    tANI_U8           BeaconPassive: 1;
++    tANI_U8                repeated: 1;
++    tANI_U8                parallel: 1;
++    tANI_U8             NeighborRpt: 1;
++    tANI_U8         LinkMeasurement: 1;
++    tANI_U8                    present;
++#else
++    tANI_U8                    present;
++    tANI_U8         LinkMeasurement: 1;
++    tANI_U8             NeighborRpt: 1;
++    tANI_U8                parallel: 1;
++    tANI_U8                repeated: 1;
++    tANI_U8           BeaconPassive: 1;
++    tANI_U8            BeaconActive: 1;
++    tANI_U8             BeaconTable: 1;
++    tANI_U8           BeaconRepCond: 1;
++    tANI_U8        FrameMeasurement: 1;
++    tANI_U8             ChannelLoad: 1;
++    tANI_U8          NoiseHistogram: 1;
++    tANI_U8              statistics: 1;
++    tANI_U8          LCIMeasurement: 1;
++    tANI_U8              LCIAzimuth: 1;
++    tANI_U8           TCMCapability: 1;
++    tANI_U8            triggeredTCM: 1;
++    tANI_U8            APChanReport: 1;
++    tANI_U8           RRMMIBEnabled: 1;
++    tANI_U8        operatingChanMax: 3;
++    tANI_U8      nonOperatinChanMax: 3;
++    tANI_U8        MeasurementPilot: 3;
++    tANI_U8 MeasurementPilotEnabled: 1;
++    tANI_U8       NeighborTSFOffset: 1;
++    tANI_U8         RCPIMeasurement: 1;
++    tANI_U8         RSNIMeasurement: 1;
++    tANI_U8       BssAvgAccessDelay: 1;
++    tANI_U8       BSSAvailAdmission: 1;
++    tANI_U8      AntennaInformation: 1;
++    tANI_U8                reserved: 6;
++#endif
++} tSirMacRRMEnabledCap, *tpSirMacRRMEnabledCap;
++
+ 
+ /* ----------------
+  *  EDCA Profiles
+diff --git a/CORE/MAC/src/include/parserApi.h b/CORE/MAC/src/include/parserApi.h
+index e5b4e0a..e625061 100644
+--- a/CORE/MAC/src/include/parserApi.h
++++ b/CORE/MAC/src/include/parserApi.h
+@@ -278,6 +278,29 @@ typedef struct sSirAssocRsp
+ #endif
+ } tSirAssocRsp, *tpSirAssocRsp;
+ 
++#if defined(FEATURE_WLAN_CCX_UPLOAD)
++// Structure to hold CCX Beacon report mandatory IEs
++typedef struct sSirCcxBcnReportMandatoryIe
++{
++    tSirMacSSid           ssId;
++    tSirMacRateSet        supportedRates;
++    tSirMacFHParamSet     fhParamSet;
++    tSirMacDsParamSetIE   dsParamSet;
++    tSirMacCfParamSet     cfParamSet;
++    tSirMacIBSSParams     ibssParamSet;
++    tSirMacTim            tim;
++    tSirMacRRMEnabledCap  rmEnabledCapabilities;
++
++    tANI_U8               ssidPresent;
++    tANI_U8               suppRatesPresent;
++    tANI_U8               fhParamPresent;
++    tANI_U8               dsParamsPresent;
++    tANI_U8               cfPresent;
++    tANI_U8               ibssParamPresent;
++    tANI_U8               timPresent;
++} tSirCcxBcnReportMandatoryIe, *tpSirCcxBcnReportMandatoryIe;
++#endif /* FEATURE_WLAN_CCX_UPLOAD */
++
+ tANI_U8
+ sirIsPropCapabilityEnabled(struct sAniSirGlobal *pMac, tANI_U32 bitnum);
+ 
+@@ -373,6 +396,15 @@ sirParseBeaconIE(struct sAniSirGlobal *pMac,
+                  tANI_U8                    *pPayload,
+                  tANI_U32                    payloadLength);
+ 
++#if defined(FEATURE_WLAN_CCX_UPLOAD)
++tSirRetStatus
++sirFillBeaconMandatoryIEforCcxBcnReport(tpAniSirGlobal    pMac,
++                                        tANI_U8          *pPayload,
++                                        const tANI_U32    payloadLength,
++                                        tANI_U8         **outIeBuf,
++                                        tANI_U32         *pOutIeLen);
++#endif /* FEATURE_WLAN_CCX_UPLOAD */
++
+ tSirRetStatus
+ sirConvertBeaconFrame2Struct(struct sAniSirGlobal *pMac,
+                              tANI_U8 *pBeaconFrame,
+diff --git a/CORE/MAC/src/include/sirParams.h b/CORE/MAC/src/include/sirParams.h
+index 3c802d3..4446d25 100644
+--- a/CORE/MAC/src/include/sirParams.h
++++ b/CORE/MAC/src/include/sirParams.h
+@@ -63,6 +63,7 @@
+ #define SIR_MAX_NUM_CHANNELS    64
+ #define SIR_MAX_NUM_STA_IN_IBSS 16
+ #define SIR_MAX_NUM_STA_IN_BSS  256
++#define SIR_CCX_MAX_MEAS_IE_REQS   8
+ 
+ typedef enum
+ {
+diff --git a/CORE/MAC/src/pe/include/rrmGlobal.h b/CORE/MAC/src/pe/include/rrmGlobal.h
+index 74af86d..de8eda0 100644
+--- a/CORE/MAC/src/pe/include/rrmGlobal.h
++++ b/CORE/MAC/src/pe/include/rrmGlobal.h
+@@ -57,9 +57,6 @@
+ 
+   ========================================================================*/
+ 
+-#define SIR_BCN_REPORT_MAX_BSS_DESC_PER_ACTION_FRAME    3
+-#define SIR_BCN_REPORT_MAX_BSS_PER_CHANNEL             15
+-
+ typedef enum eRrmRetStatus
+ {
+     eRRM_SUCCESS,
+@@ -79,11 +76,11 @@ typedef struct sSirBeaconReportReqInd
+    tANI_U16     messageType; // eWNI_SME_BEACON_REPORT_REQ_IND
+    tANI_U16     length;
+    tSirMacAddr  bssId;
+-   tANI_U16     measurementDuration;   //ms
++   tANI_U16     measurementDuration[SIR_CCX_MAX_MEAS_IE_REQS];   //ms
+    tANI_U16     randomizationInterval; //ms
+    tSirChannelInfo channelInfo;
+    tSirMacAddr      macaddrBssid;   //0: wildcard
+-   tANI_U8      fMeasurementtype;  //0:Passive, 1: Active, 2: table mode
++   tANI_U8      fMeasurementtype[SIR_CCX_MAX_MEAS_IE_REQS];  //0:Passive, 1: Active, 2: table mode
+    tAniSSID     ssId;              //May be wilcard.
+    tANI_U16      uDialogToken;
+    tSirChannelList channelList; //From AP channel report.
+@@ -100,7 +97,7 @@ typedef struct sSirBeaconReportXmitInd
+    tANI_U16    duration;
+    tANI_U8     regClass;
+    tANI_U8     numBssDesc;
+-   tpSirBssDescription pBssDescription[SIR_BCN_REPORT_MAX_BSS_DESC_PER_ACTION_FRAME];
++   tpSirBssDescription pBssDescription[SIR_BCN_REPORT_MAX_BSS_DESC];
+ } tSirBeaconReportXmitInd, * tpSirBeaconReportXmitInd;
+ 
+ typedef struct sSirNeighborReportReqInd
+diff --git a/CORE/MAC/src/pe/rrm/rrmApi.c b/CORE/MAC/src/pe/rrm/rrmApi.c
+index e6ff06b..25622fe 100644
+--- a/CORE/MAC/src/pe/rrm/rrmApi.c
++++ b/CORE/MAC/src/pe/rrm/rrmApi.c
+@@ -637,7 +637,7 @@ rrmProcessBeaconReportReq( tpAniSirGlobal pMac,
+    }
+ 
+    //Prepare the request to send to SME.
+-   pSmeBcnReportReq = vos_mem_malloc(sizeof( tSirBeaconReportReqInd ) + num_channels);
++   pSmeBcnReportReq = vos_mem_malloc(sizeof( tSirBeaconReportReqInd ));
+    if ( NULL == pSmeBcnReportReq )
+    {
+       limLog( pMac, LOGP,
+@@ -647,19 +647,16 @@ rrmProcessBeaconReportReq( tpAniSirGlobal pMac,
+ 
+    }
+ 
+-   vos_mem_set(pSmeBcnReportReq,sizeof( tSirBeaconReportReqInd ) + num_channels,0);
++   vos_mem_set(pSmeBcnReportReq,sizeof( tSirBeaconReportReqInd ),0);
+ 
+ #if defined WLAN_VOWIFI_DEBUG
+    PELOGE(limLog( pMac, LOGE, FL(" Allocated memory for pSmeBcnReportReq....will be freed by other module") );)
+ #endif
+    vos_mem_copy(pSmeBcnReportReq->bssId, pSessionEntry->bssId, sizeof(tSirMacAddr));
+    pSmeBcnReportReq->messageType = eWNI_SME_BEACON_REPORT_REQ_IND;
+-   pSmeBcnReportReq->length = sizeof( tSirBeaconReportReqInd ) + num_channels;
++   pSmeBcnReportReq->length = sizeof( tSirBeaconReportReqInd );
+    pSmeBcnReportReq->uDialogToken = pBeaconReq->measurement_token;
+-   //pSmeBcnReportReq->measurementDuration = SYS_TU_TO_MS(pBeaconReq->measurement_request.Beacon.meas_duration);
+-   pSmeBcnReportReq->measurementDuration = SYS_TU_TO_MS(measDuration /*pBeaconReq->measurement_request.Beacon.meas_duration*/);
+    pSmeBcnReportReq->randomizationInterval = SYS_TU_TO_MS (pBeaconReq->measurement_request.Beacon.randomization);
+-   pSmeBcnReportReq->fMeasurementtype = pBeaconReq->measurement_request.Beacon.meas_mode;
+    pSmeBcnReportReq->channelInfo.regulatoryClass = pBeaconReq->measurement_request.Beacon.regClass;
+    pSmeBcnReportReq->channelInfo.channelNum = pBeaconReq->measurement_request.Beacon.channel;
+    vos_mem_copy(pSmeBcnReportReq->macaddrBssid, pBeaconReq->measurement_request.Beacon.BSSID,
+@@ -686,6 +683,8 @@ rrmProcessBeaconReportReq( tpAniSirGlobal pMac,
+           pBeaconReq->measurement_request.Beacon.APChannelReport[num_APChanReport].num_channelList);
+ 
+          pChanList += pBeaconReq->measurement_request.Beacon.APChannelReport[num_APChanReport].num_channelList;
++         pSmeBcnReportReq->measurementDuration[num_APChanReport] = SYS_TU_TO_MS(measDuration /*pBeaconReq->measurement_request.Beacon.meas_duration*/);
++         pSmeBcnReportReq->fMeasurementtype[num_APChanReport] = pBeaconReq->measurement_request.Beacon.meas_mode;
+       }
+    }
+ 
+diff --git a/CORE/SME/inc/csrApi.h b/CORE/SME/inc/csrApi.h
+index 949ff50..9324c9a 100644
+--- a/CORE/SME/inc/csrApi.h
++++ b/CORE/SME/inc/csrApi.h
+@@ -475,6 +475,7 @@ typedef enum
+     eCSR_ROAM_TSM_IE_IND,
+     eCSR_ROAM_CCKM_PREAUTH_NOTIFY,
+     eCSR_ROAM_CCX_ADJ_AP_REPORT_IND,
++    eCSR_ROAM_CCX_BCN_REPORT_IND,
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ }eRoamCmdStatus;
+ 
+@@ -1186,6 +1187,7 @@ typedef struct tagCsrRoamInfo
+     tSirTsmIE tsmIe;
+     tANI_U32 timestamp[2];
+     tANI_U16 tsmRoamDelay;
++    tSirCcxBcnReportRsp *pCcxBcnReportRsp;
+ #endif /* FEATURE_WLAN_CCX_UPLOAD */
+ #endif
+     void* pRemainCtx;
+@@ -1407,6 +1409,21 @@ typedef struct tagCsrHandoffRequest
+ }tCsrHandoffRequest;
+ #endif
+ 
++#if defined(FEATURE_WLAN_CCX) && defined(FEATURE_WLAN_CCX_UPLOAD)
++typedef struct tagCsrCcxBeaconReqParams
++{
++    tANI_U16   measurementToken;
++    tANI_U8    channel;
++    tANI_U8    scanMode;
++    tANI_U16   measurementDuration;
++} tCsrCcxBeaconReqParams, *tpCsrCcxBeaconReqParams;
++
++typedef struct tagCsrCcxBeaconReq
++{
++    tANI_U8                numBcnReqIe;
++    tCsrCcxBeaconReqParams bcnReq[SIR_CCX_MAX_MEAS_IE_REQS];
++} tCsrCcxBeaconReq, *tpCsrCcxBeaconReq;
++#endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ 
+ ////////////////////////////////////////////Common SCAN starts
+ 
+diff --git a/CORE/SME/inc/smeRrmInternal.h b/CORE/SME/inc/smeRrmInternal.h
+index 69ae0be..ce27bee 100644
+--- a/CORE/SME/inc/smeRrmInternal.h
++++ b/CORE/SME/inc/smeRrmInternal.h
+@@ -112,12 +112,16 @@ typedef struct sRrmSMEContext
+    tAniSSID ssId;  //SSID used in the measuring beacon report.
+    tSirMacAddr bssId; //bssid used for beacon report measurement.
+    tANI_U16 randnIntvl; //Randomization interval to be used in subsequent measurements.
+-   tANI_U16 duration;
+-   tANI_U16 measMode;
++   tANI_U16 duration[SIR_CCX_MAX_MEAS_IE_REQS];
++   tANI_U8 measMode[SIR_CCX_MAX_MEAS_IE_REQS];
+    tRrmConfigParam rrmConfig;
+    vos_timer_t IterMeasTimer;
+    tDblLinkList neighborReportCache;
+    tRrmNeighborRequestControlInfo neighborReqControlInfo;
++
++#if defined(FEATURE_WLAN_CCX) && defined(FEATURE_WLAN_CCX_UPLOAD)
++   tCsrCcxBeaconReq  ccxBcnReqInfo;
++#endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ }tRrmSMEContext, *tpRrmSMEContext; 
+ 
+ typedef struct sRrmNeighborReq
+diff --git a/CORE/SME/inc/sme_Api.h b/CORE/SME/inc/sme_Api.h
+index 7a89c8b..48c0760 100644
+--- a/CORE/SME/inc/sme_Api.h
++++ b/CORE/SME/inc/sme_Api.h
+@@ -855,6 +855,17 @@ eHalStatus sme_GetTsmStats(tHalHandle hHal,
+ eHalStatus sme_SetCCKMIe(tHalHandle hHal, tANI_U8 sessionId, tANI_U8 *pCckmIe, tANI_U8 cckmIeLen);
+ 
+ 
++/* ---------------------------------------------------------------------------
++    \fn sme_SetCcxBeaconRequest
++    \brief  function to set CCX beacon request parameters
++    \param  hHal - HAL handle for device
++    \param  pCcxBcnReq - pointer to CCX beacon request
++    \- return Success or failure
++    -------------------------------------------------------------------------*/
++eHalStatus sme_SetCcxBeaconRequest(tHalHandle hHal, const tANI_U8 sessionId,
++                                   const tCsrCcxBeaconReq* pCcxBcnReq);
++
++
+ #endif /*FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ /* ---------------------------------------------------------------------------
+     \fn sme_CfgSetInt
+diff --git a/CORE/SME/inc/sme_RrmApi.h b/CORE/SME/inc/sme_RrmApi.h
+index 4d56e97..e14e85a 100644
+--- a/CORE/SME/inc/sme_RrmApi.h
++++ b/CORE/SME/inc/sme_RrmApi.h
+@@ -83,6 +83,6 @@ VOS_STATUS sme_RrmNeighborReportRequest(tpAniSirGlobal pMac, tANI_U8 sessionId,
+ 
+ tRrmNeighborReportDesc* smeRrmGetFirstBssEntryFromNeighborCache( tpAniSirGlobal pMac);
+ tRrmNeighborReportDesc* smeRrmGetNextBssEntryFromNeighborCache( tpAniSirGlobal pMac, tpRrmNeighborReportDesc pBssEntry);
+-
++void sme_RrmProcessBeaconReportReqInd(tpAniSirGlobal pMac, void *pMsgBuf);
+ 
+ #endif
+diff --git a/CORE/SME/src/rrm/sme_rrm.c b/CORE/SME/src/rrm/sme_rrm.c
+index aa2a67c..255fd56 100644
+--- a/CORE/SME/src/rrm/sme_rrm.c
++++ b/CORE/SME/src/rrm/sme_rrm.c
+@@ -229,7 +229,6 @@ static eHalStatus sme_RrmSendBeaconReportXmitInd( tpAniSirGlobal pMac,
+        pBeaconRep->messageType = eWNI_SME_BEACON_REPORT_RESP_XMIT_IND;
+        pBeaconRep->length = length;
+        pBeaconRep->uDialogToken = pSmeRrmContext->token;
+-       pBeaconRep->duration = pSmeRrmContext->duration;
+        pBeaconRep->regClass = pSmeRrmContext->regClass;
+        vos_mem_copy( pBeaconRep->bssId, pSmeRrmContext->sessionBssId, sizeof(tSirMacAddr) );
+ 
+@@ -262,7 +261,7 @@ static eHalStatus sme_RrmSendBeaconReportXmitInd( tpAniSirGlobal pMac,
+ 
+                pBeaconRep->numBssDesc++;
+ 
+-               if (++msgCounter >= SIR_BCN_REPORT_MAX_BSS_DESC_PER_ACTION_FRAME)
++               if (++msgCounter >= SIR_BCN_REPORT_MAX_BSS_DESC)
+                    break;
+ 
+                pCurResult = pResultArr[bssCounter + msgCounter];
+@@ -301,6 +300,156 @@ static eHalStatus sme_RrmSendBeaconReportXmitInd( tpAniSirGlobal pMac,
+    return status;
+ }
+ 
++#if defined(FEATURE_WLAN_CCX_UPLOAD)
++/**---------------------------------------------------------------------------
++
++  \brief sme_CcxSendBeaconReqScanResults()
++
++   This function sends up the scan results received as a part of
++   beacon request scanning.
++   This function is called after receiving the scan results per channel
++   Due to the limitation on the size of the IWEVCUSTOM buffer, we send 3 BSSIDs of
++   beacon report information in one custom event;
++
++  \param  - pMac -      Pointer to the Hal Handle.
++              - sessionId  - Session id
++              - channel     - scan results belongs to this channel
++              - pResultArr - scan result.
++              - measurementDone - flag to indicate that the measurement is done.
++              - bss_count - number of bss found
++  \return - 0 for success, non zero for failure
++
++  --------------------------------------------------------------------------*/
++static eHalStatus sme_CcxSendBeaconReqScanResults(tpAniSirGlobal pMac,
++                                                  tANI_U32       sessionId,
++                                                  tANI_U8        channel,
++                                                  tCsrScanResultInfo **pResultArr,
++                                                  tANI_U8        measurementDone,
++                                                  tANI_U8        bss_count)
++{
++   eHalStatus              status         = eHAL_STATUS_FAILURE;
++   tpSirBssDescription     pBssDesc       = NULL;
++   tANI_U32                ie_len         = 0;
++   tANI_U32                outIeLen       = 0;
++   tANI_U8                 bssCounter     = 0;
++   tCsrScanResultInfo     *pCurResult     = NULL;
++   tANI_U8                 msgCounter     = 0;
++   tpRrmSMEContext         pSmeRrmContext = &pMac->rrm.rrmSmeContext;
++   tCsrRoamInfo            roamInfo;
++   tSirCcxBcnReportRsp     bcnReport;
++   tpSirCcxBcnReportRsp    pBcnReport     = &bcnReport;
++   tpCsrCcxBeaconReqParams pCurMeasReqIe  = NULL;
++   tANI_U8                 i              = 0;
++
++   if (NULL == pSmeRrmContext)
++   {
++       smsLog( pMac, LOGE, "pSmeRrmContext is NULL");
++       return eHAL_STATUS_FAILURE;
++   }
++
++   if (NULL == pResultArr && !measurementDone)
++   {
++      smsLog( pMac, LOGE, "Beacon report xmit Ind to HDD Failed");
++      return eHAL_STATUS_FAILURE;
++   }
++
++   if (pResultArr)
++       pCurResult=pResultArr[bssCounter];
++
++   vos_mem_zero(&bcnReport, sizeof(tSirCcxBcnReportRsp));
++   do
++   {
++       pCurMeasReqIe = NULL;
++       for (i = 0; i < pSmeRrmContext->ccxBcnReqInfo.numBcnReqIe; i++)
++       {
++           if(pSmeRrmContext->ccxBcnReqInfo.bcnReq[i].channel == channel)
++           {
++               pCurMeasReqIe = &pSmeRrmContext->ccxBcnReqInfo.bcnReq[i];
++               break;
++           }
++       }
++       pBcnReport->measurementToken = pCurMeasReqIe->measurementToken;
++       smsLog( pMac, LOG1, "Channel(%d) MeasToken(%d)", channel, pBcnReport->measurementToken);
++
++       msgCounter=0;
++       while (pCurResult)
++       {
++           pBssDesc = &pCurResult->BssDescriptor;
++           if (NULL != pBssDesc)
++           {
++               ie_len = GET_IE_LEN_IN_BSS( pBssDesc->length );
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.ChanNum = pBssDesc->channelId;
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.Spare = 0;
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.MeasDuration = pCurMeasReqIe->measurementDuration;
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.PhyType = pBssDesc->nwType;
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.RecvSigPower = pBssDesc->rssi;
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.ParentTsf = pBssDesc->parentTSF;
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.TargetTsf[0] = pBssDesc->timeStamp[0];
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.TargetTsf[1] = pBssDesc->timeStamp[1];
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.BcnInterval = pBssDesc->beaconInterval;
++               pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.CapabilityInfo = pBssDesc->capabilityInfo;
++               vos_mem_copy(pBcnReport->bcnRepBssInfo[msgCounter].bcnReportFields.Bssid,
++                                      pBssDesc->bssId, sizeof(tSirMacAddr));
++
++               sirFillBeaconMandatoryIEforCcxBcnReport(pMac, (tANI_U8 *)pBssDesc->ieFields, ie_len,
++                                           &(pBcnReport->bcnRepBssInfo[msgCounter].pBuf), &outIeLen);
++               pBcnReport->bcnRepBssInfo[msgCounter].ieLen = outIeLen;
++
++               smsLog( pMac, LOG1,"Bssid(%02X:%02X:%02X:%02X:%02X:%02X) Channel=%d Rssi=%d",
++                       pBssDesc->bssId[0], pBssDesc->bssId[1], pBssDesc->bssId[2],
++                       pBssDesc->bssId[3], pBssDesc->bssId[4], pBssDesc->bssId[5],
++                       pBssDesc->channelId, (-1) * pBssDesc->rssi);
++
++               pBcnReport->numBss++;
++
++               if (++msgCounter >= SIR_BCN_REPORT_MAX_BSS_DESC)
++                   break;
++
++               pCurResult = pResultArr[msgCounter];
++           }
++           else
++           {
++               pCurResult = NULL;
++               break;
++           }
++       }
++
++       bssCounter += msgCounter;
++       if (!pResultArr || !pCurResult || (bssCounter >= SIR_BCN_REPORT_MAX_BSS_DESC))
++       {
++           pCurResult = NULL;
++           smsLog(pMac, LOGE,
++                  "Reached to the max/last BSS in pCurResult list");
++       }
++       else
++       {
++           pCurResult = pResultArr[bssCounter];
++           smsLog(pMac, LOGE,
++                  "Move to the next BSS set in pCurResult list");
++       }
++
++       pBcnReport->flag = (measurementDone << 1)|((pCurResult)?true:false);
++
++       smsLog(pMac, LOG1, "SME Sending BcnRep to HDD numBss(%d)"
++               " msgCounter(%d) bssCounter(%d)",
++                pBcnReport->numBss, msgCounter, bssCounter, pBcnReport->flag);
++
++       roamInfo.pCcxBcnReportRsp = pBcnReport;
++       csrRoamCallCallback(pMac, sessionId, &roamInfo,
++                           0, eCSR_ROAM_CCX_BCN_REPORT_IND, 0);
++
++       /* Free the memory allocated to IE */
++       for (i = 0; i < msgCounter; i++)
++       {
++           if (pBcnReport->bcnRepBssInfo[i].pBuf)
++               vos_mem_free(pBcnReport->bcnRepBssInfo[i].pBuf);
++       }
++   } while (pCurResult);
++   return status;
++}
++
++#endif /* FEATURE_WLAN_CCX_UPLOAD */
++
+ /**---------------------------------------------------------------------------
+   
+   \brief sme_RrmSendScanRequest() - 
+@@ -323,7 +472,7 @@ static eHalStatus sme_RrmSendScanResult( tpAniSirGlobal pMac,
+    tCsrScanResultFilter filter;
+    tScanResultHandle pResult;
+    tCsrScanResultInfo *pScanResult, *pNextResult;
+-   tCsrScanResultInfo *pScanResultsArr[SIR_BCN_REPORT_MAX_BSS_PER_CHANNEL];
++   tCsrScanResultInfo *pScanResultsArr[SIR_BCN_REPORT_MAX_BSS_DESC];
+    eHalStatus status;
+    tANI_U8 counter=0;
+    tpRrmSMEContext pSmeRrmContext = &pMac->rrm.rrmSmeContext;
+@@ -334,7 +483,7 @@ static eHalStatus sme_RrmSendScanResult( tpAniSirGlobal pMac,
+ #endif
+ 
+    vos_mem_zero( &filter, sizeof(filter) );
+-   vos_mem_zero( pScanResultsArr, sizeof(pNextResult)*SIR_BCN_REPORT_MAX_BSS_PER_CHANNEL );
++   vos_mem_zero( pScanResultsArr, sizeof(pNextResult)*SIR_BCN_REPORT_MAX_BSS_DESC );
+ 
+    filter.BSSIDs.numOfBSSIDs = 1;
+    filter.BSSIDs.bssid = &pSmeRrmContext->bssId;
+@@ -392,7 +541,18 @@ static eHalStatus sme_RrmSendScanResult( tpAniSirGlobal pMac,
+       // send a xmit indication with moreToFollow set to MEASURMENT_DONE
+       // so that PE can clean any context allocated.
+       if( measurementDone )
+-         status = sme_RrmSendBeaconReportXmitInd( pMac, NULL, measurementDone, 0 );
++      {
++#if defined(FEATURE_WLAN_CCX_UPLOAD)
++         status = sme_CcxSendBeaconReqScanResults(pMac,
++                                                  sessionId,
++                                                  chanList[0],
++                                                  NULL,
++                                                  measurementDone,
++                                                  0);
++#else
++         status = sme_RrmSendBeaconReportXmitInd( pMac, NULL, measurementDone, 0);
++#endif /*FEATURE_WLAN_CCX_UPLOAD*/
++      }
+       return status;
+    }
+ 
+@@ -407,18 +567,26 @@ static eHalStatus sme_RrmSendScanResult( tpAniSirGlobal pMac,
+       pNextResult = sme_ScanResultGetNext(pMac, pResult);
+       pScanResultsArr[counter++] = pScanResult;
+       pScanResult = pNextResult; //sme_ScanResultGetNext(hHal, pResult);
+-      if (counter >= SIR_BCN_REPORT_MAX_BSS_PER_CHANNEL)
++      if (counter >= SIR_BCN_REPORT_MAX_BSS_DESC)
+          break;
+       }
+ 
+    if (counter)
+    {
++          smsLog(pMac, LOG1, " Number of BSS Desc with RRM Scan %d ", counter);
++#if defined(FEATURE_WLAN_CCX_UPLOAD)
++       status = sme_CcxSendBeaconReqScanResults(pMac,
++                                                sessionId,
++                                                chanList[0],
++                                                pScanResultsArr,
++                                                measurementDone,
++                                                counter);
++#else
+        status = sme_RrmSendBeaconReportXmitInd( pMac,
+                                                 pScanResultsArr,
+                                                 measurementDone,
+                                                 counter);
+-       smsLog(pMac, LOG1, " Number of BSS Desc with RRM Scan %d ",
+-              counter);
++#endif /*FEATURE_WLAN_CCX_UPLOAD*/
+    }
+    sme_ScanResultPurge(pMac, pResult); 
+ 
+@@ -490,7 +658,7 @@ static eHalStatus sme_RrmScanRequestCallback(tHalHandle halHandle, void *pContex
+   \brief sme_RrmIssueScanReq() - This is called to send a scan request as part 
+          of beacon report request .
+   
+-  \param 
++  \param  pMac  - pMac global pointer
+   
+   \return eHAL_STATUS_SUCCESS - Validation is successful.
+   
+@@ -505,67 +673,101 @@ eHalStatus sme_RrmIssueScanReq( tpAniSirGlobal pMac )
+    eHalStatus status = eHAL_STATUS_SUCCESS;
+    tpRrmSMEContext pSmeRrmContext = &pMac->rrm.rrmSmeContext;
+    tANI_U32 sessionId;
++   tSirScanType scanType;
++
++   if ((pSmeRrmContext->currentIndex) >= pSmeRrmContext->channelList.numOfChannels)
++       return status;
+ 
++   scanType = pSmeRrmContext->measMode[pSmeRrmContext->currentIndex];
++   if ((eSIR_ACTIVE_SCAN == scanType) || (eSIR_PASSIVE_SCAN == scanType))
++   {
+ #if defined WLAN_VOWIFI_DEBUG
+    smsLog( pMac, LOGE, "Issue scan request " );
+ #endif
+ 
+-   vos_mem_zero( &scanRequest, sizeof(scanRequest));
++       vos_mem_zero( &scanRequest, sizeof(scanRequest));
+ 
+-   /* set scanType, active or passive */
+-   scanRequest.bcnRptReqScan = TRUE;
+-   scanRequest.scanType = pSmeRrmContext->measMode;
++       /* set scanType, active or passive */
++       scanRequest.bcnRptReqScan = TRUE;
++       scanRequest.scanType = scanType;
+ 
+-   vos_mem_copy(scanRequest.bssid,
+-         pSmeRrmContext->bssId, sizeof(scanRequest.bssid) );
++       vos_mem_copy(scanRequest.bssid,
++             pSmeRrmContext->bssId, sizeof(scanRequest.bssid) );
+ 
+-   if( pSmeRrmContext->ssId.length )
+-   {
+-      scanRequest.SSIDs.numOfSSIDs = 1;
+-      scanRequest.SSIDs.SSIDList =( tCsrSSIDInfo *)vos_mem_malloc(sizeof(tCsrSSIDInfo));
+-      if( scanRequest.SSIDs.SSIDList == NULL )
+-      {
+-         smsLog( pMac, LOGP, FL("vos_mem_malloc failed:") );
+-         return eHAL_STATUS_FAILURE;
+-      }
++       if (pSmeRrmContext->ssId.length)
++       {
++          scanRequest.SSIDs.numOfSSIDs = 1;
++          scanRequest.SSIDs.SSIDList =( tCsrSSIDInfo *)vos_mem_malloc(sizeof(tCsrSSIDInfo));
++          if (NULL == scanRequest.SSIDs.SSIDList)
++          {
++              smsLog( pMac, LOGP, FL("vos_mem_malloc failed:") );
++              return eHAL_STATUS_FAILURE;
++          }
+ #if defined WLAN_VOWIFI_DEBUG
+-      smsLog( pMac, LOGE, FL("Allocated memory for pSSIDList"));
++          smsLog( pMac, LOGE, FL("Allocated memory for pSSIDList"));
+ #endif
+-      vos_mem_zero( scanRequest.SSIDs.SSIDList, sizeof(tCsrSSIDInfo) );
+-      scanRequest.SSIDs.SSIDList->SSID.length = pSmeRrmContext->ssId.length;
+-      vos_mem_copy(scanRequest.SSIDs.SSIDList->SSID.ssId, pSmeRrmContext->ssId.ssId, pSmeRrmContext->ssId.length);
+-   }
++          vos_mem_zero( scanRequest.SSIDs.SSIDList, sizeof(tCsrSSIDInfo) );
++          scanRequest.SSIDs.SSIDList->SSID.length = pSmeRrmContext->ssId.length;
++          vos_mem_copy(scanRequest.SSIDs.SSIDList->SSID.ssId, pSmeRrmContext->ssId.ssId, pSmeRrmContext->ssId.length);
++       }
++
++       /* set min and max channel time */
++       scanRequest.minChnTime = 0; //pSmeRrmContext->duration; Dont use min timeout.
++       scanRequest.maxChnTime = pSmeRrmContext->duration[pSmeRrmContext->currentIndex];
++       smsLog( pMac, LOG1, "Scan Type(%d) Max Dwell Time(%d)", scanRequest.scanType,
++                  scanRequest.maxChnTime );
+ 
+-   /* set min and max channel time */
+-   scanRequest.minChnTime = 0; //pSmeRrmContext->duration; Dont use min timeout.
+-   scanRequest.maxChnTime = pSmeRrmContext->duration;
+ #if defined WLAN_VOWIFI_DEBUG
+-   smsLog( pMac, LOGE, "For Duration %d ", pSmeRrmContext->duration );
++       smsLog( pMac, LOGE, "For Duration %d ", scanRequest.maxChnTime );
+ #endif
+ 
+-   /* set BSSType to default type */
+-   scanRequest.BSSType = eCSR_BSS_TYPE_ANY;
++       /* set BSSType to default type */
++       scanRequest.BSSType = eCSR_BSS_TYPE_ANY;
+ 
+-   /*Scan all the channels */
+-   scanRequest.ChannelInfo.numOfChannels = 1;
++       /*Scan all the channels */
++       scanRequest.ChannelInfo.numOfChannels = 1;
+ 
+-   scanRequest.ChannelInfo.ChannelList = &pSmeRrmContext->channelList.ChannelList[pSmeRrmContext->currentIndex];
++       scanRequest.ChannelInfo.ChannelList = &pSmeRrmContext->channelList.ChannelList[pSmeRrmContext->currentIndex];
+ #if defined WLAN_VOWIFI_DEBUG
+-   smsLog( pMac, LOGE, "On channel %d ", pSmeRrmContext->channelList.ChannelList[pSmeRrmContext->currentIndex] );
++       smsLog( pMac, LOGE, "On channel %d ", pSmeRrmContext->channelList.ChannelList[pSmeRrmContext->currentIndex] );
+ #endif
+ 
+-   /* set requestType to full scan */
+-   scanRequest.requestType = eCSR_SCAN_REQUEST_FULL_SCAN;
++       /* set requestType to full scan */
++       scanRequest.requestType = eCSR_SCAN_REQUEST_FULL_SCAN;
+ 
+-   csrRoamGetSessionIdFromBSSID( pMac, (tCsrBssid*)pSmeRrmContext->sessionBssId, &sessionId );
+-   status = sme_ScanRequest( pMac, (tANI_U8)sessionId, &scanRequest, &scanId, &sme_RrmScanRequestCallback, NULL ); 
++       csrRoamGetSessionIdFromBSSID( pMac, (tCsrBssid*)pSmeRrmContext->sessionBssId, &sessionId );
++       status = sme_ScanRequest( pMac, (tANI_U8)sessionId, &scanRequest, &scanId, &sme_RrmScanRequestCallback, NULL );
+ 
+-   if ( pSmeRrmContext->ssId.length )
+-   {
+-      vos_mem_free(scanRequest.SSIDs.SSIDList);
++       if ( pSmeRrmContext->ssId.length )
++       {
++           vos_mem_free(scanRequest.SSIDs.SSIDList);
+ #if defined WLAN_VOWIFI_DEBUG
+-      smsLog( pMac, LOGE, FL("Free memory for SSIDList"));
++           smsLog( pMac, LOGE, FL("Free memory for SSIDList"));
+ #endif
++       }
++   }
++   else if (2 == scanType)  /* beacon table */
++   {
++       if ((pSmeRrmContext->currentIndex + 1) < pSmeRrmContext->channelList.numOfChannels)
++       {
++           sme_RrmSendScanResult( pMac, 1, &pSmeRrmContext->channelList.ChannelList[pSmeRrmContext->currentIndex], false );
++           pSmeRrmContext->currentIndex++; //Advance the current index.
++           sme_RrmIssueScanReq(pMac);
++       }
++       else
++       {
++           //Done with the measurement. Clean up all context and send a message to PE with measurement done flag set.
++           sme_RrmSendScanResult( pMac, 1, &pSmeRrmContext->channelList.ChannelList[pSmeRrmContext->currentIndex], true );
++           vos_mem_free( pSmeRrmContext->channelList.ChannelList );
++       }
++   }
++   else
++   {
++       smsLog( pMac, LOGE, "Unknown beacon report request mode(%d)", scanType);
++                /* Indicate measurement completion to PE */
++                /* If this is not done, pCurrentReq pointer will not be freed and
++                   PE will not handle subsequent Beacon requests */
++        sme_RrmSendBeaconReportXmitInd(pMac, NULL, true, 0);
+    }
+ 
+    return status;
+@@ -588,7 +790,7 @@ void sme_RrmProcessBeaconReportReqInd(tpAniSirGlobal pMac, void *pMsgBuf)
+ {
+    tpSirBeaconReportReqInd pBeaconReq = (tpSirBeaconReportReqInd) pMsgBuf;
+    tpRrmSMEContext pSmeRrmContext = &pMac->rrm.rrmSmeContext;
+-   tANI_U32 len,i;  
++   tANI_U32 len = 0, i = 0;
+ 
+ #if defined WLAN_VOWIFI_DEBUG
+    smsLog( pMac, LOGE, "Received Beacon report request ind Channel = %d", pBeaconReq->channelInfo.channelNum );
+@@ -620,7 +822,7 @@ void sme_RrmProcessBeaconReportReqInd(tpAniSirGlobal pMac, void *pMsgBuf)
+       len = 0;
+       pSmeRrmContext->channelList.numOfChannels = 0;
+ 
+-      //If valid channel is present. We firt Measure on the given channel. and
++      //If valid channel is present. We first Measure on the given channel. and
+       //if there are additional channels present in APchannelreport, measure on these also.
+       if ( pBeaconReq->channelInfo.channelNum != 255 )
+          len = 1;
+@@ -675,42 +877,12 @@ void sme_RrmProcessBeaconReportReqInd(tpAniSirGlobal pMac, void *pMsgBuf)
+ 
+    pSmeRrmContext->token = pBeaconReq->uDialogToken;
+    pSmeRrmContext->regClass = pBeaconReq->channelInfo.regulatoryClass;
+-
+-   switch( pBeaconReq->fMeasurementtype )
+-   {
+-      case 0: //Passive
+-      case 1: //Active
+-         pSmeRrmContext->measMode = pBeaconReq->fMeasurementtype? eSIR_ACTIVE_SCAN : eSIR_PASSIVE_SCAN ;
+-         pSmeRrmContext->duration = pBeaconReq->measurementDuration;
+          pSmeRrmContext->randnIntvl = VOS_MAX( pBeaconReq->randomizationInterval, pSmeRrmContext->rrmConfig.maxRandnInterval );
+          pSmeRrmContext->currentIndex = 0;
+-#if defined WLAN_VOWIFI_DEBUG
+-         smsLog( pMac, LOGE, "Send beacon report after scan " );
+-#endif
+-         sme_RrmIssueScanReq( pMac ); 
+-         break;
+-      case 2: //Table
+-         //Get the current scan results for the given channel and send it.
+-#if defined WLAN_VOWIFI_DEBUG
+-         smsLog( pMac, LOGE, "Send beacon report from table " );
+-#endif
+-         sme_RrmSendScanResult( pMac, pSmeRrmContext->channelList.numOfChannels, pSmeRrmContext->channelList.ChannelList, true );
+-         vos_mem_free( pSmeRrmContext->channelList.ChannelList );
+-#if defined WLAN_VOWIFI_DEBUG
+-         smsLog( pMac, LOGE, FL("Free memory for ChannelList") );
+-#endif
+-         break;
+-      default:
+-#if defined WLAN_VOWIFI_DEBUG
+-         smsLog( pMac, LOGE, "Unknown beacon report request mode");
+-#endif
+-         /* Indicate measurement completion to PE */
+-         /* If this is not done, pCurrentReq pointer will not be freed and 
+-            PE will not handle subsequent Beacon requests */
+-         sme_RrmSendBeaconReportXmitInd(pMac, NULL, true, 0);
+-         break;
++   vos_mem_copy((tANI_U8*)&pSmeRrmContext->measMode, (tANI_U8*)&pBeaconReq->fMeasurementtype, SIR_CCX_MAX_MEAS_IE_REQS);
++   vos_mem_copy((tANI_U8*)&pSmeRrmContext->duration, (tANI_U8*)&pBeaconReq->measurementDuration, SIR_CCX_MAX_MEAS_IE_REQS);
+ 
+-   }
++   sme_RrmIssueScanReq( pMac );
+ 
+    return;
+ }
+diff --git a/CORE/SME/src/sme_common/sme_Api.c b/CORE/SME/src/sme_common/sme_Api.c
+index 278b9f8..31c9962 100644
+--- a/CORE/SME/src/sme_common/sme_Api.c
++++ b/CORE/SME/src/sme_common/sme_Api.c
+@@ -1689,6 +1689,57 @@ eHalStatus sme_SetCCKMIe(tHalHandle hHal, tANI_U8 sessionId,
+     return status;
+ }
+ 
++/* ---------------------------------------------------------------------------
++    \fn sme_SetCcxBeaconRequest
++    \brief  function to set CCX beacon request parameters
++    \param  hHal       - HAL handle for device
++    \param  sessionId  - Session id
++    \param  pCcxBcnReq - pointer to CCX beacon request
++    \- return Success or failure
++    -------------------------------------------------------------------------*/
++eHalStatus sme_SetCcxBeaconRequest(tHalHandle hHal, const tANI_U8 sessionId,
++                                   const tCsrCcxBeaconReq* pCcxBcnReq)
++{
++   eHalStatus               status           = eSIR_SUCCESS;
++   tpAniSirGlobal           pMac             = PMAC_STRUCT( hHal );
++   tpSirBeaconReportReqInd  pSmeBcnReportReq = NULL;
++   tCsrCcxBeaconReqParams  *pBeaconReq       = NULL;
++   tANI_U8                  counter          = 0;
++   tCsrRoamSession         *pSession         = CSR_GET_SESSION(pMac, sessionId);
++   tpRrmSMEContext          pSmeRrmContext   = &pMac->rrm.rrmSmeContext;
++
++   /* Store the info in RRM context */
++   vos_mem_copy(&pSmeRrmContext->ccxBcnReqInfo, pCcxBcnReq, sizeof(tCsrCcxBeaconReq));
++
++   //Prepare the request to send to SME.
++   pSmeBcnReportReq = vos_mem_malloc(sizeof( tSirBeaconReportReqInd ));
++   if(NULL == pSmeBcnReportReq)
++   {
++      smsLog(pMac, LOGP, "Memory Allocation Failure!!! CCX  BcnReq Ind to SME");
++      return eSIR_FAILURE;
++   }
++
++   smsLog(pMac, LOGE, "Sending Beacon Report Req to SME");
++   vos_mem_zero( pSmeBcnReportReq, sizeof( tSirBeaconReportReqInd ));
++
++   pSmeBcnReportReq->messageType = eWNI_SME_BEACON_REPORT_REQ_IND;
++   pSmeBcnReportReq->length = sizeof( tSirBeaconReportReqInd );
++   vos_mem_copy( pSmeBcnReportReq->bssId, pSession->connectedProfile.bssid, sizeof(tSirMacAddr) );
++   pSmeBcnReportReq->channelInfo.channelNum = 255;
++   pSmeBcnReportReq->channelList.numChannels = pCcxBcnReq->numBcnReqIe;
++
++   for (counter = 0; counter < pCcxBcnReq->numBcnReqIe; counter++)
++   {
++        pBeaconReq = (tCsrCcxBeaconReqParams *)&pCcxBcnReq->bcnReq[counter];
++        pSmeBcnReportReq->fMeasurementtype[counter] = pBeaconReq->scanMode;
++        pSmeBcnReportReq->measurementDuration[counter] = SYS_TU_TO_MS(pBeaconReq->measurementDuration);
++        pSmeBcnReportReq->channelList.channelNumber[counter] = pBeaconReq->channel;
++   }
++
++   sme_RrmProcessBeaconReportReqInd(pMac, pSmeBcnReportReq);
++   return status;
++}
++
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ 
+ 
+diff --git a/CORE/SYS/legacy/src/utils/inc/utilsParser.h b/CORE/SYS/legacy/src/utils/inc/utilsParser.h
+index 5736e2a..6aa8a2c 100644
+--- a/CORE/SYS/legacy/src/utils/inc/utilsParser.h
++++ b/CORE/SYS/legacy/src/utils/inc/utilsParser.h
+@@ -60,6 +60,7 @@
+ 
+ void          ConvertSSID           (tpAniSirGlobal, tSirMacSSid*,               tDot11fIESSID*);
+ void          ConvertSuppRates      (tpAniSirGlobal, tSirMacRateSet*,            tDot11fIESuppRates*);
++void          ConvertFHParams       (tpAniSirGlobal, tSirMacFHParamSet*,         tDot11fIEFHParamSet*);
+ void          ConvertExtSuppRates   (tpAniSirGlobal, tSirMacRateSet*,            tDot11fIEExtSuppRates*);
+ void          ConvertQOSCaps        (tpAniSirGlobal, tSirMacQosCapabilityIE*,    tDot11fIEQOSCapsAp*);
+ void          ConvertQOSCapsStation (tpAniSirGlobal, tSirMacQosCapabilityStaIE*, tDot11fIEQOSCapsStation*);
+diff --git a/CORE/SYS/legacy/src/utils/src/parserApi.c b/CORE/SYS/legacy/src/utils/src/parserApi.c
+index 400b39d..057bd29 100644
+--- a/CORE/SYS/legacy/src/utils/src/parserApi.c
++++ b/CORE/SYS/legacy/src/utils/src/parserApi.c
+@@ -2628,6 +2628,202 @@ sirConvertReassocReqFrame2Struct(tpAniSirGlobal pMac,
+ 
+ } // End sirConvertReassocReqFrame2Struct.
+ 
++
++#if defined(FEATURE_WLAN_CCX_UPLOAD)
++tSirRetStatus
++sirFillBeaconMandatoryIEforCcxBcnReport(tpAniSirGlobal   pMac,
++                                        tANI_U8         *pPayload,
++                                        const tANI_U32   nPayload,
++                                        tANI_U8        **outIeBuf,
++                                        tANI_U32        *pOutIeLen)
++{
++    tDot11fBeaconIEs            *pBies = NULL;
++    tANI_U32                    status = eHAL_STATUS_SUCCESS;
++    tSirCcxBcnReportMandatoryIe ccxBcnReportMandatoryIe;
++
++    /* To store how many bytes are required to be allocated
++           for Bcn report mandatory Ies */
++    tANI_U16 numBytes = 0;
++    tANI_U8  *pos = NULL;
++
++    // Zero-init our [out] parameter,
++    vos_mem_set( (tANI_U8*)&ccxBcnReportMandatoryIe, sizeof(ccxBcnReportMandatoryIe), 0 );
++    pBies = vos_mem_malloc(sizeof(tDot11fBeaconIEs));
++    if ( NULL == pBies )
++        status = eHAL_STATUS_FAILURE;
++    else
++        status = eHAL_STATUS_SUCCESS;
++    if (!HAL_STATUS_SUCCESS(status))
++    {
++        limLog(pMac, LOGE, FL("Failed to allocate memory\n") );
++        return eSIR_FAILURE;
++    }
++    // delegate to the framesc-generated code,
++    status = dot11fUnpackBeaconIEs( pMac, pPayload, nPayload, pBies );
++
++    if ( DOT11F_FAILED( status ) )
++    {
++        limLog(pMac, LOGE, FL("Failed to parse Beacon IEs (0x%08x, %d bytes):\n"),
++                  status, nPayload);
++        vos_mem_free(pBies);
++        return eSIR_FAILURE;
++    }
++    else if ( DOT11F_WARNED( status ) )
++    {
++      limLog( pMac, LOGW, FL("There were warnings while unpacking Beacon IEs (0x%08x, %d bytes):\n"),
++                 status, nPayload );
++        PELOG2(sirDumpBuf(pMac, SIR_DBG_MODULE_ID, LOG2, pPayload, nPayload);)
++    }
++
++    // & "transliterate" from a 'tDot11fBeaconIEs' to a 'ccxBcnReportMandatoryIe'...
++    if ( !pBies->SSID.present )
++    {
++        PELOGW(limLog(pMac, LOGW, FL("Mandatory IE SSID not present!\n"));)
++    }
++    else
++    {
++        ccxBcnReportMandatoryIe.ssidPresent = 1;
++        ConvertSSID( pMac, &ccxBcnReportMandatoryIe.ssId, &pBies->SSID );
++        /* 1 for EID, 1 for length and length bytes */
++        numBytes += 1 + 1 + ccxBcnReportMandatoryIe.ssId.length;
++    }
++
++    if ( !pBies->SuppRates.present )
++    {
++        PELOGW(limLog(pMac, LOGW, FL("Mandatory IE Supported Rates not present!\n"));)
++    }
++    else
++    {
++        ccxBcnReportMandatoryIe.suppRatesPresent = 1;
++        ConvertSuppRates( pMac, &ccxBcnReportMandatoryIe.supportedRates, &pBies->SuppRates );
++        numBytes += 1 + 1 + ccxBcnReportMandatoryIe.supportedRates.numRates;
++    }
++
++    if ( pBies->FHParamSet.present)
++    {
++        ccxBcnReportMandatoryIe.fhParamPresent = 1;
++        ConvertFHParams( pMac, &ccxBcnReportMandatoryIe.fhParamSet, &pBies->FHParamSet );
++        numBytes += 1 + 1 + SIR_MAC_FH_PARAM_SET_EID_MAX;
++    }
++
++    if ( pBies->DSParams.present )
++    {
++        ccxBcnReportMandatoryIe.dsParamsPresent = 1;
++        ccxBcnReportMandatoryIe.dsParamSet.channelNumber = pBies->DSParams.curr_channel;
++        numBytes += 1 + 1 + SIR_MAC_DS_PARAM_SET_EID_MAX;
++    }
++
++    if ( pBies->CFParams.present )
++    {
++        ccxBcnReportMandatoryIe.cfPresent = 1;
++        ConvertCFParams( pMac, &ccxBcnReportMandatoryIe.cfParamSet, &pBies->CFParams );
++        numBytes += 1 + 1 + SIR_MAC_CF_PARAM_SET_EID_MAX;
++    }
++
++    if ( pBies->IBSSParams.present )
++    {
++        ccxBcnReportMandatoryIe.ibssParamPresent = 1;
++        ccxBcnReportMandatoryIe.ibssParamSet.atim = pBies->IBSSParams.atim;
++        numBytes += 1 + 1 + SIR_MAC_IBSS_PARAM_SET_EID_MAX;
++    }
++
++    if ( pBies->TIM.present )
++    {
++        ccxBcnReportMandatoryIe.timPresent = 1;
++        ccxBcnReportMandatoryIe.tim.dtimCount     = pBies->TIM.dtim_count;
++        ccxBcnReportMandatoryIe.tim.dtimPeriod    = pBies->TIM.dtim_period;
++        ccxBcnReportMandatoryIe.tim.bitmapControl = pBies->TIM.bmpctl;
++        /* As per the CCX spec, May truncate and report first 4 octets only */
++        numBytes += 1 + 1 + SIR_MAC_TIM_EID_MIN;
++    }
++
++    if ( pBies->RRMEnabledCap.present )
++    {
++        vos_mem_copy( &ccxBcnReportMandatoryIe.rmEnabledCapabilities, &pBies->RRMEnabledCap, sizeof( tDot11fIERRMEnabledCap ) );
++        numBytes += 1 + 1 + SIR_MAC_RM_ENABLED_CAPABILITY_EID_MAX;
++    }
++
++    *outIeBuf = vos_mem_malloc(numBytes);
++    if (NULL == *outIeBuf)
++    {
++        limLog(pMac, LOGP, FL("Memory Allocation failure"));
++        vos_mem_free(pBies);
++        return eSIR_FAILURE;
++    }
++    pos = *outIeBuf;
++    *pOutIeLen = numBytes;
++
++    /* Start filling the output Ie with Mandatory IE information */
++    /* Fill SSID IE */
++    *pos = SIR_MAC_SSID_EID;
++    pos++;
++    *pos = ccxBcnReportMandatoryIe.ssId.length;
++    pos++;
++    vos_mem_copy(pos, (tANI_U8*)ccxBcnReportMandatoryIe.ssId.ssId, ccxBcnReportMandatoryIe.ssId.length);
++    pos += ccxBcnReportMandatoryIe.ssId.length;
++
++    /* Fill Supported Rates IE */
++    *pos = SIR_MAC_RATESET_EID;
++    pos++;
++    *pos = ccxBcnReportMandatoryIe.supportedRates.numRates;
++    pos++;
++    vos_mem_copy(pos, (tANI_U8*)ccxBcnReportMandatoryIe.supportedRates.rate,
++                      ccxBcnReportMandatoryIe.supportedRates.numRates);
++    pos += ccxBcnReportMandatoryIe.supportedRates.numRates;
++
++    /* Fill FH Parameter set IE */
++    *pos = SIR_MAC_FH_PARAM_SET_EID;
++    pos++;
++    *pos = SIR_MAC_FH_PARAM_SET_EID_MAX;
++    pos++;
++    vos_mem_copy(pos, (tANI_U8*)&ccxBcnReportMandatoryIe.fhParamSet, SIR_MAC_FH_PARAM_SET_EID_MAX);
++    pos += SIR_MAC_FH_PARAM_SET_EID_MAX;
++
++    /* Fill DS Parameter set IE */
++    *pos = SIR_MAC_DS_PARAM_SET_EID;
++    pos++;
++    *pos = SIR_MAC_DS_PARAM_SET_EID_MAX;
++    pos++;
++    *pos = ccxBcnReportMandatoryIe.dsParamSet.channelNumber;
++    pos += SIR_MAC_DS_PARAM_SET_EID_MAX;
++
++    /* Fill CF Parameter set */
++    *pos = SIR_MAC_CF_PARAM_SET_EID;
++    pos++;
++    *pos = SIR_MAC_CF_PARAM_SET_EID_MAX;
++    pos++;
++    vos_mem_copy(pos, (tANI_U8*)&ccxBcnReportMandatoryIe.cfParamSet, SIR_MAC_CF_PARAM_SET_EID_MAX);
++    pos += SIR_MAC_CF_PARAM_SET_EID_MAX;
++
++    /* Fill IBSS Parameter set IE */
++    *pos = SIR_MAC_IBSS_PARAM_SET_EID;
++    pos++;
++    *pos = SIR_MAC_IBSS_PARAM_SET_EID_MAX;
++    pos++;
++    vos_mem_copy(pos, (tANI_U8*)&ccxBcnReportMandatoryIe.ibssParamSet.atim, SIR_MAC_IBSS_PARAM_SET_EID_MAX);
++    pos += SIR_MAC_IBSS_PARAM_SET_EID_MAX;
++
++    /* Fill TIM IE */
++    *pos = SIR_MAC_TIM_EID;
++    pos++;
++    *pos = SIR_MAC_TIM_EID_MIN;
++    pos++;
++    vos_mem_copy(pos, (tANI_U8*)&ccxBcnReportMandatoryIe.tim, SIR_MAC_TIM_EID_MIN);
++    pos += SIR_MAC_TIM_EID_MIN;
++
++    /* Fill RM Capability IE */
++    *pos = SIR_MAC_RM_ENABLED_CAPABILITY_EID;
++    pos++;
++    *pos = SIR_MAC_RM_ENABLED_CAPABILITY_EID_MAX;
++    pos++;
++    vos_mem_copy(pos, (tANI_U8*)&ccxBcnReportMandatoryIe.rmEnabledCapabilities, SIR_MAC_RM_ENABLED_CAPABILITY_EID_MAX);
++
++    vos_mem_free(pBies);
++    return eSIR_SUCCESS;
++}
++
++#endif /* FEATURE_WLAN_CCX_UPLOAD */
++
+ tSirRetStatus
+ sirParseBeaconIE(tpAniSirGlobal        pMac,
+                  tpSirProbeRespBeacon  pBeaconStruct,
+diff --git a/CORE/SYS/legacy/src/utils/src/utilsParser.c b/CORE/SYS/legacy/src/utils/src/utilsParser.c
+index f147b83..d118a56 100644
+--- a/CORE/SYS/legacy/src/utils/src/utilsParser.c
++++ b/CORE/SYS/legacy/src/utils/src/utilsParser.c
+@@ -268,6 +268,16 @@ void ConvertCFParams(tpAniSirGlobal     pMac,
+     pOld->cfpDurRemaining = pNew->cfp_durremaining;
+ }
+ 
++void ConvertFHParams (tpAniSirGlobal        pMac,
++                      tSirMacFHParamSet    *pOld,
++                      tDot11fIEFHParamSet  *pNew)
++{
++    pOld->dwellTime   = pNew->dwell_time;
++    pOld->hopSet      = pNew->hop_set;
++    pOld->hopPattern  = pNew->hop_pattern;
++    pOld->hopIndex    = pNew->hop_index;
++}
++
+ void ConvertTIM(tpAniSirGlobal pMac,
+                       tSirMacTim    *pOld,
+                       tDot11fIETIM     *pNew)
+-- 
+1.8.2.1
+
