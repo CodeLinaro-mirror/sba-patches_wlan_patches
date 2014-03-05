@@ -1,0 +1,30 @@
+From 480d2ff09fef44e2c40df8eee9186c87d628c7d1 Mon Sep 17 00:00:00 2001
+From: c_hpothu <c_hpothu@qti.qualcomm.com>
+Date: Mon, 17 Feb 2014 12:55:36 +0530
+Subject: [PATCH] wlan: Resolved returning incorrect RSSI value.
+
+Invalid RRSI is read by upper layer because of returning incorrect
+length of buffer. Returning correct length by  by including
+SSIDLEN to the return value of scnprintf(), in iw_get_rssi().
+
+Change-Id: I8b68de372050bcf38c7fb8b043d0557d79250fab
+CRs-Fixed: 616225.
+
+Conflicts:
+	CORE/HDD/src/wlan_hdd_wext.c
+
+diff --git a/CORE/HDD/src/wlan_hdd_wext.c b/CORE/HDD/src/wlan_hdd_wext.c
+index f482c0e..8a9e7de 100644
+--- a/CORE/HDD/src/wlan_hdd_wext.c
++++ b/CORE/HDD/src/wlan_hdd_wext.c
+@@ -2567,6 +2567,7 @@ static int iw_get_rssi(struct net_device *dev,
+           /* append the rssi to the ssid in the format required by
+              the WiFI Framework */
+           rc = snprintf(&cmd[ssidlen], len - ssidlen, " rssi %d", s7Rssi);
++          rc += ssidlen;
+       }
+       else
+       {
+-- 
+1.8.2.1
+
