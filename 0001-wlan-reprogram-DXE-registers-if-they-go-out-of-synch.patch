@@ -1,0 +1,363 @@
+From d54c47792ce2b5013a2843792637d0b5c428479b Mon Sep 17 00:00:00 2001
+From: Mihir Shete <smihir@qti.qualcomm.com>
+Date: Sun, 2 Mar 2014 14:14:47 +0530
+Subject: [PATCH] wlan: reprogram DXE registers if they go out of synch
+
+TX Data stalls are observed when the DXE channel registers
+are not programmed with valid DXE descriptors. Whenever
+a TX stall is detected try to check if the DXE registers
+are programmed correctly, if they are not, re-program them.
+
+Change-Id: Idf35009f21567d8f9cff502198c6c1569c6b6d9c
+CRs-Fixed: 609227
+(cherry picked from commit 366db93e19f319417be6dc1df3aa7e5243d11053)
+---
+ CORE/DXE/inc/wlan_qct_dxe.h             |  9 ++--
+ CORE/DXE/src/wlan_qct_dxe.c             | 75 ++++++++++++++++++++++++++++-----
+ CORE/WDA/inc/wlan_qct_wda.h             |  9 ++--
+ CORE/WDA/src/wlan_qct_wda.c             | 14 +++---
+ CORE/WDI/CP/inc/wlan_qct_wdi.h          |  9 ++--
+ CORE/WDI/CP/src/wlan_qct_wdi.c          | 11 ++---
+ CORE/WDI/TRP/DTS/inc/wlan_qct_wdi_dts.h | 13 +++---
+ CORE/WDI/TRP/DTS/src/wlan_qct_wdi_dts.c |  4 +-
+ CORE/WDI/WPAL/inc/wlan_qct_pal_device.h |  5 +++
+ 9 files changed, 109 insertions(+), 40 deletions(-)
+
+diff --git a/CORE/DXE/inc/wlan_qct_dxe.h b/CORE/DXE/inc/wlan_qct_dxe.h
+index c0529ee..928f30e 100644
+--- a/CORE/DXE/inc/wlan_qct_dxe.h
++++ b/CORE/DXE/inc/wlan_qct_dxe.h
+@@ -423,9 +423,10 @@ wpt_uint32 WLANDXE_GetFreeTxDataResNumber
+ 
+   @  Parameters
+     displaySnapshot : Display DXE snapshot option
+-    enableStallDetect : Enable stall detect feature
+-                        This feature will take effect to data performance
+-                        Not integrate till fully verification
++    debugFlags      : Enable stall detect features
++                      defined by WPAL_DeviceDebugFlags
++                      These features may effect
++                      data performance.
+ 
+   @  Return
+     NONE
+@@ -434,7 +435,7 @@ wpt_uint32 WLANDXE_GetFreeTxDataResNumber
+ void WLANDXE_ChannelDebug
+ (
+    wpt_boolean    displaySnapshot,
+-   wpt_boolean    enableStallDetect   
++   wpt_uint8      debugFlags
+ );
+ 
+ #ifdef WLANDXE_TEST_CHANNEL_ENABLE
+diff --git a/CORE/DXE/src/wlan_qct_dxe.c b/CORE/DXE/src/wlan_qct_dxe.c
+index 0febc3b..fab897b 100644
+--- a/CORE/DXE/src/wlan_qct_dxe.c
++++ b/CORE/DXE/src/wlan_qct_dxe.c
+@@ -4128,6 +4128,39 @@ void dxeTXReSyncDesc
+ }
+ 
+ /*==========================================================================
++  @  Function Name
++      dxeDebugTxDescReSync
++
++  @  Description
++       Check DXE Tx channel state and correct it in
++       case Tx Data stall is detected by calling
++       %dxeTXReSyncDesc. Also ensure that WCN SS
++       is not power collapsed before calling
++       %dxeTXReSyncDesc
++
++  @  Parameters
++      void    *msgPtr
++               Message pointer to sync with TX thread
++
++  @  Return
++      NONE
++===========================================================================*/
++void dxeDebugTxDescReSync
++(
++   wpt_msg                  *msgPtr
++)
++{
++   HDXE_MSG(eWLAN_MODULE_DAL_DATA, eWLAN_PAL_TRACE_LEVEL_ERROR,
++               "%s: Check for DXE TX Async",__func__);
++   /* Make wake up HW */
++   dxeNotifySmsm(eWLAN_PAL_FALSE, eWLAN_PAL_TRUE);
++   dxeNotifySmsm(eWLAN_PAL_TRUE, eWLAN_PAL_FALSE);
++
++   wpalSleep(10);
++
++   dxeTXReSyncDesc(msgPtr);
++}
++/*==========================================================================
+   @  Function Name 
+       dxeTXISR
+ 
+@@ -5437,9 +5470,10 @@ wpt_uint32 WLANDXE_GetFreeTxDataResNumber
+ 
+   @  Parameters
+     displaySnapshot : Display DXE snapshot option
+-    enableStallDetect : Enable stall detect feature
+-                        This feature will take effect to data performance
+-                        Not integrate till fully verification
++    debugFlags      : Enable stall detect features
++                      defined by WPAL_DeviceDebugFlags
++                      These features may effect
++                      data performance.
+ 
+   @  Return
+     NONE
+@@ -5447,11 +5481,12 @@ wpt_uint32 WLANDXE_GetFreeTxDataResNumber
+ ===========================================================================*/
+ void WLANDXE_ChannelDebug
+ (
+-   wpt_boolean    displaySnapshot,
+-   wpt_boolean    enableStallDetect   
++   wpt_boolean displaySnapshot,
++   wpt_uint8   debugFlags
+ )
+ {
+    wpt_msg                  *channelDebugMsg;
++   wpt_msg                  *txDescReSyncMsg ;
+    wpt_uint32                regValue;
+    wpt_status                status = eWLAN_PAL_STATUS_SUCCESS;
+ 
+@@ -5494,12 +5529,32 @@ void WLANDXE_ChannelDebug
+       }
+    }
+ 
+-   /* Debug Type 2, toggling stall detect enable/disable */
+-   if(enableStallDetect)
++   if(debugFlags & WPAL_DEBUG_TX_DESC_RESYNC)
+    {
+-      HDXE_MSG(eWLAN_MODULE_DAL_DATA, eWLAN_PAL_TRACE_LEVEL_WARN,
+-               "DXE TX Stall detect",
+-               0, 0, 0);
++      txDescReSyncMsg = (wpt_msg *)wpalMemoryAllocate(sizeof(wpt_msg));
++      if(NULL == txDescReSyncMsg)
++      {
++         HDXE_MSG(eWLAN_MODULE_DAL_DATA, eWLAN_PAL_TRACE_LEVEL_ERROR,
++                  "%s: Resync MSG MEM alloc Fail",__func__);
++      }
++      else
++      {
++         txDescReSyncMsg->callback = dxeDebugTxDescReSync;
++         txDescReSyncMsg->pContext = tempDxeCtrlBlk;
++         status = wpalPostTxMsg(WDI_GET_PAL_CTX(),
++                                txDescReSyncMsg);
++         if(eWLAN_PAL_STATUS_SUCCESS != status)
++         {
++            HDXE_MSG(eWLAN_MODULE_DAL_DATA, eWLAN_PAL_TRACE_LEVEL_ERROR,
++                     "%s: Post TX re-sync MSG fail",__func__);
++         }
++      }
++   }
++
++   if(debugFlags & WPAL_DEBUG_START_HEALTH_TIMER)
++   {
++      HDXE_MSG(eWLAN_MODULE_DAL_DATA, eWLAN_PAL_TRACE_LEVEL_ERROR,
++               "DXE TX Stall detect");
+       /* Start Stall detect timer and detect stall */
+       wpalTimerStart(&tempDxeCtrlBlk->dxeChannel[WDTS_CHANNEL_TX_LOW_PRI].healthMonitorTimer,
+                      T_WLANDXE_PERIODIC_HEALTH_M_TIME);
+diff --git a/CORE/WDA/inc/wlan_qct_wda.h b/CORE/WDA/inc/wlan_qct_wda.h
+index 9009764..c7b0c6b 100644
+--- a/CORE/WDA/inc/wlan_qct_wda.h
++++ b/CORE/WDA/inc/wlan_qct_wda.h
+@@ -1859,9 +1859,10 @@ tANI_U8 WDA_getFwWlanFeatCaps(tANI_U8 featEnumValue);
+   PARAMETERS
+     pMac : upper MAC context pointer
+     displaySnapshot : Display DXE snapshot option
+-    enableStallDetect : Enable stall detect feature
+-                        This feature will take effect to data performance
+-                        Not integrate till fully verification
++    debugFlags      : Enable stall detect features
++                      defined by WPAL_DeviceDebugFlags
++                      These features may effect
++                      data performance.
+ 
+   RETURN VALUE
+     NONE
+@@ -1871,7 +1872,7 @@ void WDA_TransportChannelDebug
+ (
+   tpAniSirGlobal pMac,
+   v_BOOL_t       displaySnapshot,
+-  v_BOOL_t       toggleStallDetect
++  v_U8_t         debugFlags
+ );
+ 
+ /*==========================================================================
+diff --git a/CORE/WDA/src/wlan_qct_wda.c b/CORE/WDA/src/wlan_qct_wda.c
+index ed8c53c..e289695 100644
+--- a/CORE/WDA/src/wlan_qct_wda.c
++++ b/CORE/WDA/src/wlan_qct_wda.c
+@@ -72,6 +72,7 @@
+ #include "vos_nvitem.h"
+ #include "sirApi.h"
+ #include "wlan_qct_pal_packet.h"
++#include "wlan_qct_pal_device.h"
+ #include "wlan_qct_wda.h"
+ #include "wlan_qct_wda_msg.h"
+ #include "wlan_qct_wdi_cfg.h"
+@@ -11026,7 +11027,7 @@ VOS_STATUS WDA_TxPacket(tWDA_CbContext *pWDA,
+                                 after the packet gets completed(packet freed once)*/
+ 
+       /* TX MGMT fail with COMP timeout, try to detect DXE stall */
+-      WDA_TransportChannelDebug(pMac, 1, 0);
++      WDA_TransportChannelDebug(pMac, 1, WPAL_DEBUG_TX_DESC_RESYNC);
+ 
+       /*Tag Frame as timed out for later deletion*/
+       vos_pkt_set_user_data_ptr( (vos_pkt_t *)pFrmBuf, VOS_PKT_USER_DATA_ID_WDA, 
+@@ -14695,9 +14696,10 @@ VOS_STATUS WDA_ProcessUpdateOpMode(tWDA_CbContext *pWDA,
+   PARAMETERS
+     pMac : upper MAC context pointer
+     displaySnapshot : Display DXE snapshot option
+-    enableStallDetect : Enable stall detect feature
+-                        This feature will take effect to data performance
+-                        Not integrate till fully verification
++    debugFlags      : Enable stall detect features
++                      defined by WPAL_DeviceDebugFlags
++                      These features may effect
++                      data performance.
+ 
+   RETURN VALUE
+     NONE
+@@ -14707,10 +14709,10 @@ void WDA_TransportChannelDebug
+ (
+   tpAniSirGlobal pMac,
+   v_BOOL_t       displaySnapshot,
+-  v_BOOL_t       toggleStallDetect
++  v_U8_t         debugFlags
+ )
+ {
+-   WDI_TransportChannelDebug(displaySnapshot, toggleStallDetect);
++   WDI_TransportChannelDebug(displaySnapshot, debugFlags);
+    return;
+ }
+ 
+diff --git a/CORE/WDI/CP/inc/wlan_qct_wdi.h b/CORE/WDI/CP/inc/wlan_qct_wdi.h
+index cd2731b..39959c3 100644
+--- a/CORE/WDI/CP/inc/wlan_qct_wdi.h
++++ b/CORE/WDI/CP/inc/wlan_qct_wdi.h
+@@ -10012,16 +10012,17 @@ WDI_UpdateVHTOpModeReq
+     Or if host driver detects any abnormal stcuk may display
+ 
+  @param  displaySnapshot : Display DXE snapshot option
+- @param  enableStallDetect : Enable stall detect feature
+-                        This feature will take effect to data performance
+-                        Not integrate till fully verification
++ @param  debugFlags      : Enable stall detect features
++                           defined by WPAL_DeviceDebugFlags
++                           These features may effect
++                           data performance.
+  @see
+  @return none
+ */
+ void WDI_TransportChannelDebug
+ (
+    wpt_boolean  displaySnapshot,
+-   wpt_boolean  toggleStallDetect
++   wpt_uint8    debugFlags
+ );
+ 
+ /**
+diff --git a/CORE/WDI/CP/src/wlan_qct_wdi.c b/CORE/WDI/CP/src/wlan_qct_wdi.c
+index 4ab2d9a..a6c2e1d 100644
+--- a/CORE/WDI/CP/src/wlan_qct_wdi.c
++++ b/CORE/WDI/CP/src/wlan_qct_wdi.c
+@@ -27956,19 +27956,20 @@ WDI_UpdateVHTOpModeReq
+     Or if host driver detects any abnormal stcuk may display
+         
+  @param  displaySnapshot : Display DXE snapshot option
+- @param  enableStallDetect : Enable stall detect feature
+-                        This feature will take effect to data performance
+-                        Not integrate till fully verification
++ @param  debugFlags      : Enable stall detect features
++                           defined by WPAL_DeviceDebugFlags
++                           These features may effect
++                           data performance.
+  @see
+  @return none
+ */
+ void WDI_TransportChannelDebug
+ (
+    wpt_boolean  displaySnapshot,
+-   wpt_boolean  toggleStallDetect
++   wpt_uint8    debugFlags
+ )
+ {
+-   WDTS_ChannelDebug(displaySnapshot, toggleStallDetect);
++   WDTS_ChannelDebug(displaySnapshot, debugFlags);
+    return;
+ }
+ /**
+diff --git a/CORE/WDI/TRP/DTS/inc/wlan_qct_wdi_dts.h b/CORE/WDI/TRP/DTS/inc/wlan_qct_wdi_dts.h
+index 398b8b2..23795e2 100644
+--- a/CORE/WDI/TRP/DTS/inc/wlan_qct_wdi_dts.h
++++ b/CORE/WDI/TRP/DTS/inc/wlan_qct_wdi_dts.h
+@@ -128,7 +128,7 @@ typedef struct {
+   wpt_status (*setPowerState) (void *pContext, WDTS_PowerStateType   powerState, 
+                                WDTS_SetPSCbType cBack);
+   void (*channelDebug)(wpt_boolean displaySnapshot,
+-                       wpt_boolean enableStallDetect);
++                       wpt_uint8   debugFlags);
+   wpt_status (*stop) (void *pContext);
+   wpt_status (*close) (void *pContext);
+   wpt_uint32 (*getFreeTxDataResNumber) (void *pContext);
+@@ -239,13 +239,16 @@ wpt_status WDTS_SetPowerState(void *pContext, WDTS_PowerStateType powerState,
+  * Or if host driver detects any abnormal stcuk may display
+  * Parameters:
+  *  displaySnapshot : Display DXE snapshot option
+- *  enableStallDetect : Enable stall detect feature
+-                        This feature will take effect to data performance
+-                        Not integrate till fully verification
++ *  debugFlags      : Enable stall detect features
++ *                    defined by WPAL_DeviceDebugFlags
++ *                    These features may effect
++ *                    data performance.
++ *
++ *                    Not integrate till fully verification
+  * Return Value: NONE
+  *
+  */
+-void WDTS_ChannelDebug(wpt_boolean displaySnapshot, wpt_boolean toggleStallDetect);
++void WDTS_ChannelDebug(wpt_boolean displaySnapshot, wpt_uint8 debugFlags);
+ 
+ /* DTS Stop function. 
+  * Stop Transport driver, ie DXE, SDIO
+diff --git a/CORE/WDI/TRP/DTS/src/wlan_qct_wdi_dts.c b/CORE/WDI/TRP/DTS/src/wlan_qct_wdi_dts.c
+index d3861dd..190571e 100644
+--- a/CORE/WDI/TRP/DTS/src/wlan_qct_wdi_dts.c
++++ b/CORE/WDI/TRP/DTS/src/wlan_qct_wdi_dts.c
+@@ -980,9 +980,9 @@ wpt_status WDTS_SetPowerState(void *pContext, WDTS_PowerStateType  powerState,
+  * Return Value: NONE
+  *
+  */
+-void WDTS_ChannelDebug(wpt_boolean displaySnapshot, wpt_boolean toggleStallDetect)
++void WDTS_ChannelDebug(wpt_boolean displaySnapshot, wpt_uint8 debugFlags)
+ {
+-   gTransportDriver.channelDebug(displaySnapshot, toggleStallDetect);
++   gTransportDriver.channelDebug(displaySnapshot, debugFlags);
+    return;
+ }
+ 
+diff --git a/CORE/WDI/WPAL/inc/wlan_qct_pal_device.h b/CORE/WDI/WPAL/inc/wlan_qct_pal_device.h
+index a838a13..2d9a5e4 100644
+--- a/CORE/WDI/WPAL/inc/wlan_qct_pal_device.h
++++ b/CORE/WDI/WPAL/inc/wlan_qct_pal_device.h
+@@ -80,6 +80,11 @@
+ #define     WPAL_SMSM_WLAN_TX_ENABLE          0x00000400
+ #define     WPAL_SMSM_WLAN_TX_RINGS_EMPTY     0x00000200
+ 
++typedef enum
++{
++   WPAL_DEBUG_START_HEALTH_TIMER = 1<<0,
++   WPAL_DEBUG_TX_DESC_RESYNC     = 1<<1,
++} WPAL_DeviceDebugFlags;
+ /* ====================================================================================================================
+   @  Function Name 
+       wpalIsrType
+-- 
+1.8.2.1
+
