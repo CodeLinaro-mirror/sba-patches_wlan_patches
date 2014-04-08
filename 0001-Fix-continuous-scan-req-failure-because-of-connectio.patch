@@ -1,0 +1,97 @@
+From 2ea40d82fc38b6edf0b9764015e1811241058326 Mon Sep 17 00:00:00 2001
+From: Mahesh A Saptasagar <c_msapta@qti.qualcomm.com>
+Date: Wed, 26 Feb 2014 16:28:06 +0530
+Subject: [PATCH 1/2] Fix continuous scan req failure because of connection in
+ progress
+
+In random case, driver rejects all scan request for longer time saying that
+connection in progress. There are two changes covered in this patch to fix
+that issue.
+1) When disconnect request comes from user space, wlan_hdd_disconnect()
+   issues disconnect request to SME and waits for the disconnect completion
+   with 500ms timeout. In some rare cases, whole disconnection process
+   takes more than 500 ms to complete. On such senario, wlan_hdd_disconnect
+   posts success to upper layer (immediately after 500ms) even before whole
+   disconnection process completes. To force wlan_hdd_disconnect() to wait
+   more time, disconnect timeout value is increased from 500 ms to 2 sec.
+2) Also, scan done callback changed to report correct scan status to
+   cfg80211. Earlier scan result status always informed as success
+   irrespective of actual scan result. This change mainly for cfg80211
+   not to post any scan results to user space in scan failure cases.
+
+Change-Id: I651a35532d9594615de2731f992ff1b6aeb2cb0b
+CRs-Fixed: 623307
+---
+ CORE/HDD/inc/wlan_hdd_main.h     |  2 +-
+ CORE/HDD/src/wlan_hdd_cfg80211.c | 23 ++++++++++++++++++++---
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/CORE/HDD/inc/wlan_hdd_main.h b/CORE/HDD/inc/wlan_hdd_main.h
+index a4bf98e..8d70670 100644
+--- a/CORE/HDD/inc/wlan_hdd_main.h
++++ b/CORE/HDD/inc/wlan_hdd_main.h
+@@ -112,7 +112,7 @@
+ #define TDLS_INIT_DONE         (6)
+ 
+ /** Maximum time(ms)to wait for disconnect to complete **/
+-#define WLAN_WAIT_TIME_DISCONNECT  500
++#define WLAN_WAIT_TIME_DISCONNECT  2000
+ #define WLAN_WAIT_TIME_STATS       800
+ #define WLAN_WAIT_TIME_POWER       800
+ #define WLAN_WAIT_TIME_COUNTRY     1000
+diff --git a/CORE/HDD/src/wlan_hdd_cfg80211.c b/CORE/HDD/src/wlan_hdd_cfg80211.c
+index ba27a08..e48d948 100644
+--- a/CORE/HDD/src/wlan_hdd_cfg80211.c
++++ b/CORE/HDD/src/wlan_hdd_cfg80211.c
+@@ -4421,6 +4421,7 @@ static eHalStatus hdd_cfg80211_scan_done_callback(tHalHandle halHandle,
+     hdd_scaninfo_t *pScanInfo = &pHddCtx->scan_info;
+     struct cfg80211_scan_request *req = NULL;
+     int ret = 0;
++    bool aborted = false;
+ 
+     ENTER();
+ 
+@@ -4514,7 +4515,11 @@ static eHalStatus hdd_cfg80211_scan_done_callback(tHalHandle halHandle,
+      * cfg80211_scan_done informing NL80211 about completion
+      * of scanning
+      */
+-    cfg80211_scan_done(req, false);
++    if (status == eCSR_SCAN_ABORT || status == eCSR_SCAN_FAILURE)
++    {
++         aborted = true;
++    }
++    cfg80211_scan_done(req, aborted);
+     complete(&pScanInfo->abortscan_event_var);
+ 
+ allow_suspend:
+@@ -5938,13 +5943,25 @@ int wlan_hdd_disconnect( hdd_adapter_t *pAdapter, u16 reason )
+                __func__, (int)status );
+         return -EINVAL;
+     }
+-    wait_for_completion_interruptible_timeout(
++    status = wait_for_completion_interruptible_timeout(
+                 &pAdapter->disconnect_comp_var,
+                 msecs_to_jiffies(WLAN_WAIT_TIME_DISCONNECT));
++    if (!status)
++    {
++        hddLog(VOS_TRACE_LEVEL_ERROR,
++              "%s: Failed to disconnect, timed out", __func__);
++        return -ETIMEDOUT;
++    }
++    else if (status == -ERESTARTSYS)
++    {
++        hddLog(VOS_TRACE_LEVEL_ERROR,
++               "%s: Failed to disconnect, wait interrupted", __func__);
++        return status;
++    }
+     /*stop tx queues*/
+     netif_tx_disable(pAdapter->dev);
+     netif_carrier_off(pAdapter->dev);
+-    return status;
++    return 0;
+ }
+ 
+ 
+-- 
+1.8.2.1
+
