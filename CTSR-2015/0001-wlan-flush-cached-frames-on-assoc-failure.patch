@@ -1,0 +1,158 @@
+From 41f960182a465efb11f4848ebf5968ed288af17f Mon Sep 17 00:00:00 2001
+From: Mihir Shete <smihir@qti.qualcomm.com>
+Date: Fri, 11 Apr 2014 16:36:37 +0530
+Subject: [PATCH] wlan: flush cached frames on assoc failure
+
+Prima driver caches RX frames till the peer
+is registered in TL. If assocication failure
+occurs then free the cached frames so that
+the RX resources are returned back to the
+system.
+
+Change-Id: I37d6c08075dc77026ad85863e4838eb5e3742fc3
+CRs-Fixed: 643670
+---
+ CORE/HDD/src/wlan_hdd_assoc.c |  2 ++
+ CORE/TL/src/wlan_qct_tl.c     | 39 ++++++++++++++++++++++++++++-----------
+ CORE/TL/src/wlan_qct_tli.h    | 14 +++++++++++++-
+ 3 files changed, 43 insertions(+), 12 deletions(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_assoc.c b/CORE/HDD/src/wlan_hdd_assoc.c
+index a3fb630..9b3c6b4 100644
+--- a/CORE/HDD/src/wlan_hdd_assoc.c
++++ b/CORE/HDD/src/wlan_hdd_assoc.c
+@@ -1507,6 +1507,8 @@ static eHalStatus hdd_AssociationCompletionHandler( hdd_adapter_t *pAdapter, tCs
+         /*Clear the roam profile*/
+         hdd_clearRoamProfileIe( pAdapter );
+ 
++        WLANTL_AssocFailed(pRoamInfo->staId);
++
+         netif_tx_disable(dev);
+         netif_carrier_off(dev);
+ 
+diff --git a/CORE/TL/src/wlan_qct_tl.c b/CORE/TL/src/wlan_qct_tl.c
+index 058a5e9..fc7cf04 100644
+--- a/CORE/TL/src/wlan_qct_tl.c
++++ b/CORE/TL/src/wlan_qct_tl.c
+@@ -1059,7 +1059,7 @@ void WLANTL_AssocFailed(v_U8_t staId)
+   if(!VOS_IS_STATUS_SUCCESS(WLANTL_StartForwarding(staId,0,0)))
+   {
+     VOS_TRACE(VOS_MODULE_ID_TL, VOS_TRACE_LEVEL_ERROR,
+-       " %s fails to start forwarding", __func__);
++       " %s fails to start forwarding (staId %d)", __func__, staId);
+   }
+ }
+   
+@@ -4739,12 +4739,28 @@ WLANTL_CacheSTAFrame
+     {
+       /*this is the first frame that we are caching */
+       pClientSTA->vosBegCachedFrame = vosTempBuff;
++
++      pClientSTA->tlCacheInfo.cacheInitTime = vos_timer_get_system_time();
++      pClientSTA->tlCacheInfo.cacheDoneTime =
++              pClientSTA->tlCacheInfo.cacheInitTime;
++      pClientSTA->tlCacheInfo.cacheSize = 1;
++
+     }
+     else
+     {
+       /*this is a subsequent frame that we are caching: chain to the end */
+       vos_pkt_chain_packet(pClientSTA->vosEndCachedFrame,
+                            vosTempBuff, VOS_TRUE);
++
++      pClientSTA->tlCacheInfo.cacheDoneTime = vos_timer_get_system_time();
++      pClientSTA->tlCacheInfo.cacheSize ++;
++
++      if (pClientSTA->tlCacheInfo.cacheSize % WLANTL_CACHE_TRACE_WATERMARK == 0)
++      {
++        VOS_TRACE(VOS_MODULE_ID_TL, VOS_TRACE_LEVEL_ERROR,
++                  "%s: Cache High watermark for staid:%d (%d)",
++                  __func__,ucSTAId, pClientSTA->tlCacheInfo.cacheSize);
++      }
+     }
+     pClientSTA->vosEndCachedFrame = vosTempBuff;
+   }/*else new packet*/
+@@ -4934,6 +4950,8 @@ done:
+    -------------------------------------------------------------------------*/
+   pClientSTA->vosBegCachedFrame = NULL;
+   pClientSTA->vosEndCachedFrame = NULL;
++  pClientSTA->tlCacheInfo.cacheSize = 0;
++  pClientSTA->tlCacheInfo.cacheClearTime = vos_timer_get_system_time();
+ 
+     /*-----------------------------------------------------------------------
+     After all the init is complete we can mark the existance flag 
+@@ -5995,6 +6013,15 @@ WLANTL_RxCachedFrames
+     return VOS_STATUS_E_INVAL;
+   }
+ 
++  pClientSTA = pTLCb->atlSTAClients[ucSTAId];
++
++  if ( NULL == pClientSTA )
++  {
++    TLLOGE(VOS_TRACE( VOS_MODULE_ID_TL, VOS_TRACE_LEVEL_ERROR,
++        "WLAN TL:Client Memory was not allocated on %s", __func__));
++    return VOS_STATUS_E_FAILURE;
++  }
++
+   /*---------------------------------------------------------------------
+     Save the initial buffer - this is the first received buffer
+    ---------------------------------------------------------------------*/
+@@ -6065,16 +6092,6 @@ WLANTL_RxCachedFrames
+       Check if the packet that we cached matches the DPU signature of the
+       newly added station 
+     -------------------------------------------------------------------------*/
+-    pClientSTA = pTLCb->atlSTAClients[ucSTAId];
+-
+-
+-    if ( NULL == pClientSTA )
+-    {
+-      TLLOGE(VOS_TRACE( VOS_MODULE_ID_TL, VOS_TRACE_LEVEL_ERROR,
+-          "WLAN TL:Client Memory was not allocated on %s", __func__));
+-      return VOS_STATUS_E_FAILURE;
+-    }
+-
+     if ( broadcast )
+     {
+       ucBcastSig = (v_U8_t)uDPUSig;
+diff --git a/CORE/TL/src/wlan_qct_tli.h b/CORE/TL/src/wlan_qct_tli.h
+index 0df3de6..fc58bbd 100644
+--- a/CORE/TL/src/wlan_qct_tli.h
++++ b/CORE/TL/src/wlan_qct_tli.h
+@@ -254,6 +254,7 @@ when        who    what, where, why
+   ((WLANTL_BT_AMP_TYPE_AR == usType) || (WLANTL_BT_AMP_TYPE_SEC == usType) || \
+    (WLANTL_BT_AMP_TYPE_LS_REQ == usType) || (WLANTL_BT_AMP_TYPE_LS_REP == usType))
+ 
++#define WLANTL_CACHE_TRACE_WATERMARK 100
+ /*---------------------------------------------------------------------------
+   TL signals for TX thread
+ ---------------------------------------------------------------------------*/
+@@ -477,6 +478,17 @@ typedef struct
+ }WLANTL_UAPSDInfoType;
+ 
+ /*---------------------------------------------------------------------------
++  per-STA cache info
++---------------------------------------------------------------------------*/
++typedef struct
++{
++  v_U16_t               cacheSize;
++  v_TIME_t              cacheInitTime;
++  v_TIME_t              cacheDoneTime;
++  v_TIME_t              cacheClearTime;
++}WLANTL_CacheInfoType;
++
++/*---------------------------------------------------------------------------
+   STA Client type
+ ---------------------------------------------------------------------------*/
+ typedef struct
+@@ -597,7 +609,7 @@ typedef struct
+   /*Begining of the cached packets chain*/
+   vos_pkt_t*                 vosEndCachedFrame;
+ 
+-
++  WLANTL_CacheInfoType       tlCacheInfo;
+   /* LWM related fields */
+ 
+   //current station is slow. LWM mode is enabled.
+-- 
+1.8.2.1
+
