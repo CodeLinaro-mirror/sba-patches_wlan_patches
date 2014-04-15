@@ -1,0 +1,32 @@
+From 3c8abf864148ea82e44813f68493493aeec39152 Mon Sep 17 00:00:00 2001
+From: Siddharth Bhal <sbhal@qti.qualcomm.com>
+Date: Wed, 2 Apr 2014 00:09:45 +0530
+Subject: [PATCH 1/2] wlan: TL: Flush cache frames when clean STA.
+
+We need to flush cache frames when cleaning STA even though STA
+isn't still register with TL, to avoid race condition where
+continious lim state machine changes cause number of cache
+packets to grow large in number which cause low rx resource.
+CRs-fixed: 638523
+
+Change-Id: Ie44e98d0891f3a669ecf3e22b3416b434774807b
+---
+ CORE/TL/src/wlan_qct_tl.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/CORE/TL/src/wlan_qct_tl.c b/CORE/TL/src/wlan_qct_tl.c
+index 747ab79..1326190 100644
+--- a/CORE/TL/src/wlan_qct_tl.c
++++ b/CORE/TL/src/wlan_qct_tl.c
+@@ -1498,6 +1498,8 @@ WLANTL_ClearSTAClient
+   {
+     TLLOGE(VOS_TRACE( VOS_MODULE_ID_TL, VOS_TRACE_LEVEL_ERROR,
+     "WLAN TL:Station was not previously registered on WLANTL_ClearSTAClient"));
++    /* Clean packets cached for the STA */
++    WLANTL_StartForwarding(ucSTAId,0,0);
+     return VOS_STATUS_E_EXISTS;
+   }
+ 
+-- 
+1.8.2.1
+
