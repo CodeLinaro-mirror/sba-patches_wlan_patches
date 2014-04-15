@@ -1,0 +1,267 @@
+From c1f19ef053829c31e6ba521a22ec59347a8be3e2 Mon Sep 17 00:00:00 2001
+From: Mihir Shete <smihir@qti.qualcomm.com>
+Date: Tue, 11 Mar 2014 15:38:30 +0530
+Subject: [PATCH 1/2] wlan: Change the behavior of isLoadUnloadInProgres
+
+Some APIs (wlan_hdd_linux_reg_notifier) can be allowed to execute if
+driver load is in progress but should be blocked if driver unload is in
+progress, to be able to cater to the needs of such APIs change
+isLoadUnloadInProgress so that it can distinguish between driver load
+and unload.
+
+Change-Id: I80d42a2b1cc2e161c5405bcc8440f3fb02c6d4a7
+CRs-Fixed: 629537
+---
+ CORE/HDD/inc/wlan_hdd_main.h         | 17 +++++++++++++++-
+ CORE/HDD/src/wlan_hdd_assoc.c        |  4 ++--
+ CORE/HDD/src/wlan_hdd_cfg80211.c     |  8 ++++----
+ CORE/HDD/src/wlan_hdd_main.c         |  8 ++++----
+ CORE/HDD/src/wlan_hdd_p2p.c          |  2 +-
+ CORE/HDD/src/wlan_hdd_softap_tx_rx.c |  2 +-
+ CORE/VOSS/src/vos_nvitem.c           | 38 ++++++++++++++++++++++++++++++++++++
+ CORE/VOSS/src/vos_sched.c            |  2 +-
+ 8 files changed, 67 insertions(+), 14 deletions(-)
+
+diff --git a/CORE/HDD/inc/wlan_hdd_main.h b/CORE/HDD/inc/wlan_hdd_main.h
+index a4bf98e..20d8db1 100644
+--- a/CORE/HDD/inc/wlan_hdd_main.h
++++ b/CORE/HDD/inc/wlan_hdd_main.h
+@@ -528,6 +528,13 @@ typedef enum
+    WLAN_HDD_TM_LEVEL_MAX
+ } WLAN_TmLevelEnumType;
+ 
++typedef enum
++{
++   WLAN_HDD_NO_LOAD_UNLOAD_IN_PROGRESS = 0 ,
++   WLAN_HDD_LOAD_IN_PROGRESS           = 1<<0,
++   WLAN_HDD_UNLOAD_IN_PROGRESS         = 1<<1,
++}load_unload_sequence;
++
+ /* Driver Action based on thermal mitigation level structure */
+ typedef struct
+ {
+@@ -1126,7 +1133,7 @@ struct hdd_context_s
+ 
+    volatile v_BOOL_t isLogpInProgress;
+ 
+-   v_BOOL_t isLoadUnloadInProgress;
++   v_U8_t isLoadUnloadInProgress;
+    
+    /**Track whether driver has been suspended.*/
+    hdd_ps_state_t hdd_ps_state;
+@@ -1254,7 +1261,15 @@ struct hdd_context_s
+ };
+ 
+ 
++#define WLAN_HDD_IS_LOAD_IN_PROGRESS(pHddCtx)  \
++            (pHddCtx->isLoadUnloadInProgress & WLAN_HDD_LOAD_IN_PROGRESS)
++
++#define WLAN_HDD_IS_UNLOAD_IN_PROGRESS(pHddCtx)  \
++            (pHddCtx->isLoadUnloadInProgress & WLAN_HDD_UNLOAD_IN_PROGRESS)
+ 
++#define WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx)  \
++            (pHddCtx->isLoadUnloadInProgress &    \
++              (WLAN_HDD_UNLOAD_IN_PROGRESS | WLAN_HDD_UNLOAD_IN_PROGRESS))
+ /*--------------------------------------------------------------------------- 
+   Function declarations and documenation
+   -------------------------------------------------------------------------*/ 
+diff --git a/CORE/HDD/src/wlan_hdd_assoc.c b/CORE/HDD/src/wlan_hdd_assoc.c
+index fe4f935..2b76950 100644
+--- a/CORE/HDD/src/wlan_hdd_assoc.c
++++ b/CORE/HDD/src/wlan_hdd_assoc.c
+@@ -686,7 +686,7 @@ static void hdd_SendAssociationEvent(struct net_device *dev,tCsrRoamInfo *pCsrRo
+     msg = NULL;
+     /*During the WLAN uninitialization,supplicant is stopped before the
+       driver so not sending the status of the connection to supplicant*/
+-    if(pHddCtx->isLoadUnloadInProgress != TRUE)
++    if(pHddCtx->isLoadUnloadInProgress == WLAN_HDD_NO_LOAD_UNLOAD_IN_PROGRESS)
+     {
+         wireless_send_event(dev, we_event, &wrqu, msg);
+ #ifdef FEATURE_WLAN_CCX
+@@ -776,7 +776,7 @@ static eHalStatus hdd_DisConnectHandler( hdd_adapter_t *pAdapter, tCsrRoamInfo *
+     {
+         /*During the WLAN uninitialization,supplicant is stopped before the
+             driver so not sending the status of the connection to supplicant*/
+-        if(pHddCtx->isLoadUnloadInProgress != TRUE)
++        if(pHddCtx->isLoadUnloadInProgress == WLAN_HDD_NO_LOAD_UNLOAD_IN_PROGRESS)
+         {
+             hddLog(VOS_TRACE_LEVEL_INFO_HIGH,
+                     "%s: sent disconnected event to nl80211",
+diff --git a/CORE/HDD/src/wlan_hdd_cfg80211.c b/CORE/HDD/src/wlan_hdd_cfg80211.c
+index ba27a08..26c65b3 100644
+--- a/CORE/HDD/src/wlan_hdd_cfg80211.c
++++ b/CORE/HDD/src/wlan_hdd_cfg80211.c
+@@ -4081,7 +4081,7 @@ wlan_hdd_cfg80211_inform_bss_frame( hdd_adapter_t *pAdapter,
+     status = wlan_hdd_validate_context(pHddCtx);
+ 
+     /*bss_update is not allowed during wlan driver loading or unloading*/
+-    if (pHddCtx->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
+     {
+          VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                     "%s:Loading_unloading in Progress. Ignore!!!",__func__);
+@@ -4275,7 +4275,7 @@ static int wlan_hdd_cfg80211_update_bss( struct wiphy *wiphy,
+ 
+ 
+     /*bss_update is not allowed during wlan driver loading or unloading*/
+-    if (pHddCtx->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
+     {
+         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                    "%s:Loading_unloading in Progress. Ignore!!!",__func__);
+@@ -7814,7 +7814,7 @@ static int wlan_hdd_cfg80211_sched_scan_stop(struct wiphy *wiphy,
+         return ret;
+     }
+ 
+-    if (pHddCtx->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
+     {
+         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                   "%s: Unloading/Loading in Progress. Ignore!!!", __func__);
+@@ -8867,7 +8867,7 @@ int wlan_hdd_cfg80211_resume_wlan(struct wiphy *wiphy)
+         return 0;
+     }
+ 
+-    if (pHddCtx->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
+     {
+         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                   "%s: Unloading/Loading in Progress. Ignore!!!", __func__);
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index 984eb1b..e23272d 100644
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -466,7 +466,7 @@ int wlan_hdd_validate_context(hdd_context_t *pHddCtx)
+         return -EAGAIN;
+     }
+ 
+-    if (pHddCtx->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
+     {
+         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                   "%s: Unloading/Loading in Progress. Ignore!!!", __func__);
+@@ -7689,7 +7689,7 @@ int hdd_wlan_startup(struct device *dev )
+ 
+    pHddCtx->wiphy = wiphy;
+    hdd_prevent_suspend();
+-   pHddCtx->isLoadUnloadInProgress = TRUE;
++   pHddCtx->isLoadUnloadInProgress = WLAN_HDD_LOAD_IN_PROGRESS;
+ 
+    vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, TRUE);
+ 
+@@ -8236,7 +8236,7 @@ int hdd_wlan_startup(struct device *dev )
+ 
+    mutex_init(&pHddCtx->sap_lock);
+ 
+-   pHddCtx->isLoadUnloadInProgress = FALSE;
++   pHddCtx->isLoadUnloadInProgress = WLAN_HDD_NO_LOAD_UNLOAD_IN_PROGRESS;
+ 
+ #ifdef WLAN_OPEN_SOURCE
+ #ifdef WLAN_FEATURE_HOLD_RX_WAKELOCK
+@@ -8609,7 +8609,7 @@ static void hdd_driver_exit(void)
+       }
+ 
+ 
+-      pHddCtx->isLoadUnloadInProgress = TRUE;
++      pHddCtx->isLoadUnloadInProgress = WLAN_HDD_UNLOAD_IN_PROGRESS;
+       vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, TRUE);
+ 
+       //Do all the cleanup before deregistering the driver
+diff --git a/CORE/HDD/src/wlan_hdd_p2p.c b/CORE/HDD/src/wlan_hdd_p2p.c
+index 14e207d..e029e23 100644
+--- a/CORE/HDD/src/wlan_hdd_p2p.c
++++ b/CORE/HDD/src/wlan_hdd_p2p.c
+@@ -304,7 +304,7 @@ static int wlan_hdd_request_remain_on_channel( struct wiphy *wiphy,
+      * wlan driver is keep on receiving the remain on channel command
+      * and which is resulting in crash. So not allowing any remain on
+      * channel requets when Load/Unload is in progress*/
+-    if (((hdd_context_t*)pAdapter->pHddCtx)->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(((hdd_context_t *)pAdapter->pHddCtx)))
+     {
+         hddLog( LOGE,
+                 "%s: Wlan Load/Unload is in progress", __func__);
+diff --git a/CORE/HDD/src/wlan_hdd_softap_tx_rx.c b/CORE/HDD/src/wlan_hdd_softap_tx_rx.c
+index 173f900..97954e9 100644
+--- a/CORE/HDD/src/wlan_hdd_softap_tx_rx.c
++++ b/CORE/HDD/src/wlan_hdd_softap_tx_rx.c
+@@ -1685,7 +1685,7 @@ VOS_STATUS hdd_softap_stop_bss( hdd_adapter_t *pAdapter)
+     pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
+ 
+     /*bss deregister is not allowed during wlan driver loading or unloading*/
+-    if (pHddCtx->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
+     {
+         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                    "%s:Loading_unloading in Progress. Ignore!!!",__func__);
+diff --git a/CORE/VOSS/src/vos_nvitem.c b/CORE/VOSS/src/vos_nvitem.c
+index 479330d..321900c 100644
+--- a/CORE/VOSS/src/vos_nvitem.c
++++ b/CORE/VOSS/src/vos_nvitem.c
+@@ -3508,6 +3508,17 @@ int wlan_hdd_linux_reg_notifier(struct wiphy *wiphy,
+ #endif
+     }
+ 
++    if (WLAN_HDD_IS_UNLOAD_IN_PROGRESS(pHddCtx))
++    {
++       VOS_TRACE( VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_ERROR,
++                   ("%s Unload is in progress"), __func__ );
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0))
++        return;
++#else
++        return 0;
++#endif
++    }
++
+     /* first check if this callback is in response to the driver callback */
+ 
+     if (request->initiator == NL80211_REGDOM_SET_BY_DRIVER)
+@@ -3900,6 +3911,33 @@ int wlan_hdd_crda_reg_notifier(struct wiphy *wiphy,
+ 
+     wiphy_dbg(wiphy, "info: cfg80211 reg_notifier callback for country"
+                      " %c%c\n", request->alpha2[0], request->alpha2[1]);
++
++    /* During load and SSR, vos_open (which will lead to WDA_SetRegDomain)
++     * is called before we assign pHddCtx->hHal so we might get it as
++     * NULL here leading to crash.
++     */
++    if (NULL == pHddCtx)
++    {
++       VOS_TRACE( VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_ERROR,
++                   ("%s Invalid pHddCtx pointer"), __func__);
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0))
++       return;
++#else
++       return 0;
++#endif
++    }
++    if((WLAN_HDD_IS_UNLOAD_IN_PROGRESS(pHddCtx)) ||
++        pHddCtx->isLogpInProgress)
++    {
++        VOS_TRACE( VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_ERROR,
++                   ("%s load/unload or SSR is in progress Ignore"), __func__ );
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0))
++       return;
++#else
++       return 0;
++#endif
++    }
++
+     if (request->initiator == NL80211_REGDOM_SET_BY_USER)
+     {
+        int status;
+diff --git a/CORE/VOSS/src/vos_sched.c b/CORE/VOSS/src/vos_sched.c
+index 70741da..1458543 100644
+--- a/CORE/VOSS/src/vos_sched.c
++++ b/CORE/VOSS/src/vos_sched.c
+@@ -1781,7 +1781,7 @@ VOS_STATUS vos_watchdog_wlan_shutdown(void)
+     /* Release the lock here */
+     spin_unlock(&gpVosWatchdogContext->wdLock);
+ 
+-    if (pHddCtx->isLoadUnloadInProgress)
++    if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
+     {
+         VOS_TRACE(VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_FATAL,
+                 "%s: Load/unload in Progress. Ignoring signaling Watchdog",
+-- 
+1.8.2.1
+

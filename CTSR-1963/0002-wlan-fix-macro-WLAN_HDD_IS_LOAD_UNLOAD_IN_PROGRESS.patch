@@ -1,0 +1,30 @@
+From 3a0277256e3b63bb3947eb978deccfe2688ef24a Mon Sep 17 00:00:00 2001
+From: Mihir Shete <smihir@qti.qualcomm.com>
+Date: Fri, 11 Apr 2014 20:04:01 +0530
+Subject: [PATCH 2/2] wlan: fix macro WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS
+
+The macro WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS does not
+check if driver load is in progress, fix it.
+
+Change-Id: I9d74f340b54bcaae22627ec90ef83b97f0c6d02f
+CRs-Fixed: 647250
+---
+ CORE/HDD/inc/wlan_hdd_main.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CORE/HDD/inc/wlan_hdd_main.h b/CORE/HDD/inc/wlan_hdd_main.h
+index 20d8db1..27f57aa 100644
+--- a/CORE/HDD/inc/wlan_hdd_main.h
++++ b/CORE/HDD/inc/wlan_hdd_main.h
+@@ -1269,7 +1269,7 @@ struct hdd_context_s
+ 
+ #define WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx)  \
+             (pHddCtx->isLoadUnloadInProgress &    \
+-              (WLAN_HDD_UNLOAD_IN_PROGRESS | WLAN_HDD_UNLOAD_IN_PROGRESS))
++              (WLAN_HDD_LOAD_IN_PROGRESS | WLAN_HDD_UNLOAD_IN_PROGRESS))
+ /*--------------------------------------------------------------------------- 
+   Function declarations and documenation
+   -------------------------------------------------------------------------*/ 
+-- 
+1.8.2.1
+
