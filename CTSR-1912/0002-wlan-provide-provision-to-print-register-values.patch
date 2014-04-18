@@ -1,0 +1,131 @@
+From 70230d646ec2d98f100de28a1532e7c99ed0f3bc Mon Sep 17 00:00:00 2001
+From: Hanumantha Reddy Pothula <c_hpothu@codeaurora.org>
+Date: Thu, 17 Apr 2014 20:52:49 +0530
+Subject: [PATCH 2/2] wlan: provide provision to print register values.
+
+Add new firmware indication, 'WLAN_HAL_PRINT_REG_INFO_IND', to
+print registers values.
+
+Change-Id: I00291853c04417d2c9d4b0991e6871fde0c17226
+CRs-Fixed: 648872
+---
+ CORE/WDI/CP/inc/wlan_qct_wdi_i.h | 20 +++++++++++++++
+ CORE/WDI/CP/src/wlan_qct_wdi.c   | 54 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/CORE/WDI/CP/inc/wlan_qct_wdi_i.h b/CORE/WDI/CP/inc/wlan_qct_wdi_i.h
+index af5105c..481bb27 100644
+--- a/CORE/WDI/CP/inc/wlan_qct_wdi_i.h
++++ b/CORE/WDI/CP/inc/wlan_qct_wdi_i.h
+@@ -818,6 +818,10 @@ typedef enum
+   WDI_BATCHSCAN_RESULT_IND           =  WDI_HAL_IND_MIN + 17,
+ 
+   WDI_HAL_CH_AVOID_IND                 = WDI_HAL_IND_MIN + 18,
++
++  /* print register values indication from FW to Host */
++  WDI_PRINT_REG_INFO_IND               = WDI_HAL_IND_MIN + 19,
++
+   WDI_MAX_RESP
+ }WDI_ResponseEnumType; 
+ 
+@@ -5642,5 +5646,21 @@ WDI_ProcessChAvoidInd
+ );
+ #endif /* FEATURE_WLAN_CH_AVOID */
+ 
++/**
++ @brief v -
++
++
++ @param  pWDICtx : wdi context
++         pEventData : indication data
++ @see
++ @return Result of the function call
++*/
++WDI_Status
++WDI_printRegInfo
++(
++  WDI_ControlBlockType*  pWDICtx,
++  WDI_EventInfoType*     pEventData
++);
++
+ #endif /*WLAN_QCT_WDI_I_H*/
+ 
+diff --git a/CORE/WDI/CP/src/wlan_qct_wdi.c b/CORE/WDI/CP/src/wlan_qct_wdi.c
+index 63838b7..9de7371 100644
+--- a/CORE/WDI/CP/src/wlan_qct_wdi.c
++++ b/CORE/WDI/CP/src/wlan_qct_wdi.c
+@@ -677,6 +677,7 @@ WDI_RspProcFuncType  pfnRspProcTbl[WDI_MAX_RESP] =
+    NULL,
+ #endif /* FEATURE_WLAN_CH_AVOID */
+ 
++  WDI_printRegInfo,                        /* WDI_PRINT_REG_INFO_IND */
+ };
+ 
+ 
+@@ -23233,6 +23234,9 @@ case WLAN_HAL_DEL_STA_SELF_RSP:
+   case WLAN_HAL_UPDATE_CHANNEL_LIST_RSP:
+     return WDI_UPDATE_CHAN_RESP;
+ 
++  case WLAN_HAL_PRINT_REG_INFO_IND:
++    return  WDI_PRINT_REG_INFO_IND;
++
+   default:
+     return eDRIVER_TYPE_MAX;
+   }
+@@ -29343,3 +29347,53 @@ WDI_ProcessChAvoidInd
+   return WDI_STATUS_SUCCESS;
+ }
+ #endif /* FEATURE_WLAN_CH_AVOID */
++
++WDI_Status
++WDI_printRegInfo
++(
++  WDI_ControlBlockType*  pWDICtx,
++  WDI_EventInfoType*     pEventData
++)
++{
++   tHalRegDebugInfo *pRegTable;
++   tHalRegDebugInfoParams *pRegParams;
++   uint32 cnt=0;
++
++   WPAL_TRACE(eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_INFO,
++                  "%s: ", __func__);
++    /*-------------------------------------------------------------------------
++     Sanity check
++    -------------------------------------------------------------------------*/
++   if (( NULL == pWDICtx ) || ( NULL == pEventData ) ||
++       ( NULL == pEventData->pEventData))
++   {
++       WPAL_TRACE(eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_WARN,
++                  "%s: Invalid parameters", __func__);
++       WDI_ASSERT(0);
++       return WDI_STATUS_E_FAILURE;
++   }
++
++   pRegParams  = (tHalRegDebugInfoParams *)pEventData->pEventData;
++
++   WPAL_TRACE(eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_FATAL,
++          "%s: regCount: %x scenario: %x reasonCode: %x", __func__,
++           pRegParams->regCount, pRegParams->scenario, pRegParams->reasonCode);
++
++   pRegTable = (tHalRegDebugInfo *)(pRegParams+1); //data starts after regParams
++
++   if (pRegParams->regCount <= 0)
++   {
++       WPAL_TRACE (eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_FATAL,
++                   "%s incorrect parameters passed", __func__);
++       return WDI_STATUS_E_FAILURE;
++   }
++
++   while(pRegParams->regCount--)
++   {
++       WPAL_TRACE (eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_FATAL,
++                   "%x: %x", pRegTable[cnt].regAddr, pRegTable[cnt].regValue);
++       cnt++;
++   }
++
++   return WDI_STATUS_SUCCESS;
++}
+-- 
+1.8.2.1
+

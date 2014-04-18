@@ -1,0 +1,61 @@
+From 2684e6d9dc07150dd10f14e40dafd3d7ef8f392a Mon Sep 17 00:00:00 2001
+From: Hanumantha Reddy Pothula <c_hpothu@codeaurora.org>
+Date: Thu, 17 Apr 2014 20:37:13 +0530
+Subject: [PATCH 1/2] wlan: updating interface file.
+
+Add new firmware indication, 'WLAN_HAL_PRINT_REG_INFO_IND', to
+print registers values.
+
+Change-Id: I73bc6e000ab00a7b668d3a5916dd8768aa0cdda2
+CRs-Fixed: 648872.
+---
+ riva/inc/wlan_hal_msg.h | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/riva/inc/wlan_hal_msg.h b/riva/inc/wlan_hal_msg.h
+index ac2c3dc..125bb8f 100644
+--- a/riva/inc/wlan_hal_msg.h
++++ b/riva/inc/wlan_hal_msg.h
+@@ -437,6 +437,10 @@ typedef enum
+    WLAN_HAL_IP_FORWARD_TABLE_UPDATE_IND     = 232,
+ 
+    WLAN_HAL_AVOID_FREQ_RANGE_IND            = 233,
++
++   /* print register values */
++   WLAN_HAL_PRINT_REG_INFO_IND              = 259, /* Assigned same value that of Master one */
++
+   WLAN_HAL_MSG_MAX = WLAN_HAL_MSG_TYPE_MAX_ENUM_SIZE
+ }tHalHostMsgType;
+ 
+@@ -6988,5 +6992,28 @@ typedef PACKED_PRE struct PACKED_POST
+ #else
+ #endif
+ 
++/*---------------------------------------------------------------------------
++ * WLAN_HAL_PRINT_REG_INFO_IND
++ *--------------------------------------------------------------------------*/
++
++typedef PACKED_PRE struct PACKED_POST
++{
++   uint32 regAddr;
++   uint32 regValue;
++} tHalRegDebugInfo, *tpRegDebugInfo;
++
++typedef PACKED_PRE struct PACKED_POST
++{
++   uint32 regCount;
++   uint32 scenario;
++   uint32 reasonCode;
++} tHalRegDebugInfoParams, *tpRegDebugInfoParams;
++
++typedef PACKED_PRE struct PACKED_POST
++{
++   tHalMsgHeader header;
++   tHalRegDebugInfoParams regParams;
++} tHalRegDebugInfoMsg, *tpRegDebugInfoMsg;
++
+ #endif /* _WLAN_HAL_MSG_H_ */
+ 
+-- 
+1.8.2.1
+
