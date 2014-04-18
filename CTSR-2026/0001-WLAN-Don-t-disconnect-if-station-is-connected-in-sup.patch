@@ -1,0 +1,105 @@
+From a6819b2e923eafd0cf5d739a89c5940a85548c77 Mon Sep 17 00:00:00 2001
+From: Agarwal Ashish <ashishka@qti.qualcomm.com>
+Date: Tue, 8 Apr 2014 19:53:00 +0530
+Subject: [PATCH] WLAN: Don't disconnect if station is connected in supported
+ band.
+
+If station is connected in 2.4 GHz and band capability is changed
+from Auto to 2.4 GHz only, station is getting disconnect.
+Same is the case with 5 GHz.
+Right now disconnection is issued when in connected state
+if new band capability is not the supported one.
+Disconnect will happen only in case of if connected channel is
+not supported in new Band.
+
+CRs-Fixed: 634330
+Change-Id: Ie18102e252922fd7b97be1295a27ff8fe1a9bfa2
+---
+ CORE/HDD/inc/wlan_hdd_assoc.h |  1 +
+ CORE/HDD/src/wlan_hdd_assoc.c | 18 ++++++++++++++++++
+ CORE/HDD/src/wlan_hdd_wext.c  |  7 ++++++-
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/CORE/HDD/inc/wlan_hdd_assoc.h b/CORE/HDD/inc/wlan_hdd_assoc.h
+index eab1bb0..58d32d5 100644
+--- a/CORE/HDD/inc/wlan_hdd_assoc.h
++++ b/CORE/HDD/inc/wlan_hdd_assoc.h
+@@ -127,6 +127,7 @@ typedef struct hdd_mon_ctx_s  hdd_mon_ctx_t;
+ 
+ 
+ extern v_BOOL_t hdd_connIsConnected( hdd_station_ctx_t *pHddStaCtx );
++eCsrBand hdd_connGetConnectedBand( hdd_station_ctx_t *pHddStaCtx );
+ extern eHalStatus hdd_smeRoamCallback( void *pContext, tCsrRoamInfo *pRoamInfo, v_U32_t roamId, 
+                                 eRoamCmdStatus roamStatus, eCsrRoamResult roamResult );
+ 
+diff --git a/CORE/HDD/src/wlan_hdd_assoc.c b/CORE/HDD/src/wlan_hdd_assoc.c
+index 9a89f67..6c5eec1 100644
+--- a/CORE/HDD/src/wlan_hdd_assoc.c
++++ b/CORE/HDD/src/wlan_hdd_assoc.c
+@@ -185,6 +185,24 @@ v_BOOL_t hdd_connIsConnected( hdd_station_ctx_t *pHddStaCtx )
+    return( hdd_connGetConnectionState( pHddStaCtx, NULL ) );
+ }
+ 
++eCsrBand hdd_connGetConnectedBand( hdd_station_ctx_t *pHddStaCtx )
++{
++   v_U8_t staChannel = 0;
++
++   if ( eConnectionState_Associated == pHddStaCtx->conn_info.connState )
++   {
++       staChannel = pHddStaCtx->conn_info.operationChannel;
++   }
++
++   if ( staChannel > 0 && staChannel < 14 )
++       return eCSR_BAND_24;
++   else if (staChannel >= 36 && staChannel <= 165 )
++      return eCSR_BAND_5G;
++   else  /* If station is not connected return as eCSR_BAND_ALL */
++      return eCSR_BAND_ALL;
++}
++
++
+ //TODO - Not used anyhwere. Can be removed.
+ #if 0
+ //
+diff --git a/CORE/HDD/src/wlan_hdd_wext.c b/CORE/HDD/src/wlan_hdd_wext.c
+index cdd4ec3..3a5a0eb 100644
+--- a/CORE/HDD/src/wlan_hdd_wext.c
++++ b/CORE/HDD/src/wlan_hdd_wext.c
+@@ -113,6 +113,7 @@
+ #include "wlan_hdd_dev_pwr.h"
+ #include "qc_sap_ioctl.h"
+ #include "sme_Api.h"
++#include "wlan_hdd_assoc.h"
+ 
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+ extern void hdd_suspend_wlan(struct early_suspend *wlan_suspend);
+@@ -7086,6 +7087,7 @@ int hdd_setBand_helper(struct net_device *dev, tANI_U8* ptr)
+     hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
+     tANI_U8 band = 0;
+     eCsrBand currBand = eCSR_BAND_MAX;
++    eCsrBand connectedBand;
+ 
+     band = ptr[WLAN_HDD_UI_SET_BAND_VALUE_OFFSET] - '0'; /*convert the band value from ascii to integer*/
+ 
+@@ -7103,6 +7105,8 @@ int hdd_setBand_helper(struct net_device *dev, tANI_U8* ptr)
+         default:
+             band = eCSR_BAND_MAX;
+     }
++    connectedBand =
++          hdd_connGetConnectedBand(WLAN_HDD_GET_STATION_CTX_PTR(pAdapter));
+ 
+         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO, "%s: change band to %u",
+                 __func__, band);
+@@ -7159,7 +7163,8 @@ int hdd_setBand_helper(struct net_device *dev, tANI_U8* ptr)
+         sme_FilterScanResults(hHal, pAdapter->sessionId);
+ 
+         if (band != eCSR_BAND_ALL &&
+-            hdd_connIsConnected(WLAN_HDD_GET_STATION_CTX_PTR(pAdapter)))
++            hdd_connIsConnected(WLAN_HDD_GET_STATION_CTX_PTR(pAdapter)) &&
++            (connectedBand != band))
+         {
+              hdd_station_ctx_t *pHddStaCtx = &(pAdapter)->sessionCtx.station;
+              eHalStatus status = eHAL_STATUS_SUCCESS;
+-- 
+1.8.2.1
+
