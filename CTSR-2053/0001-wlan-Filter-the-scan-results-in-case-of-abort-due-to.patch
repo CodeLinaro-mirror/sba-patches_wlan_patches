@@ -1,0 +1,130 @@
+From 71783934a21f5dfdad89a6b4e78343c871a7b091 Mon Sep 17 00:00:00 2001
+From: "Srinivas, Dasari" <dasaris@qti.qualcomm.com>
+Date: Fri, 7 Feb 2014 12:40:09 +0530
+Subject: [PATCH] wlan: Filter the scan results in case of abort due to band
+ change
+
+The scan results need to be filterd based on the current band and
+valid channel list in case of band change, to avoid the connection
+with APs from non-selected band.  If there is any ongoing scan,
+that scan can be aborted and the scan results needs to be filtered.
+
+Set a flag in the scan command in csrScanAbortMacScan() if the
+abort reason is eCSR_SCAN_ABORT_DUE_TO_BAND_CHANGE. Filter the
+scan results after the scan completion, based on that flag.
+
+CRs-Fixed: 592516
+Change-Id: I6ee1f0359ab536fb1bfe5b32ee102d50f886ffd8
+---
+ CORE/HDD/src/wlan_hdd_wext.c  | 29 +++++++++++++++++------------
+ CORE/SME/inc/csrInternal.h    |  2 ++
+ CORE/SME/src/csr/csrApiScan.c | 26 ++++++++++++++++++++++++++
+ 3 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_wext.c b/CORE/HDD/src/wlan_hdd_wext.c
+index 5bad662..53705fd 100644
+--- a/CORE/HDD/src/wlan_hdd_wext.c
++++ b/CORE/HDD/src/wlan_hdd_wext.c
+@@ -7239,7 +7239,23 @@ int hdd_setBand_helper(struct net_device *dev, tANI_U8* ptr)
+                 "%s: Current band value = %u, new setting %u ",
+                  __func__, currBand, band);
+ 
+-        if (hdd_connIsConnected(WLAN_HDD_GET_STATION_CTX_PTR(pAdapter)))
++        /* We need to change the band and flush the scan results here itself
++         * as we may get timeout for disconnection in which we will return
++         * with out doing any of these
++         */
++        if (eHAL_STATUS_SUCCESS != sme_SetFreqBand(hHal, (eCsrBand)band))
++        {
++             VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_FATAL,
++                     "%s: failed to set the band value to %u ",
++                        __func__, band);
++             return -EINVAL;
++        }
++        wlan_hdd_cfg80211_update_band(pHddCtx->wiphy, (eCsrBand)band);
++        hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DUE_TO_BAND_CHANGE);
++        sme_FilterScanResults(hHal, pAdapter->sessionId);
++
++        if (band != eCSR_BAND_ALL &&
++            hdd_connIsConnected(WLAN_HDD_GET_STATION_CTX_PTR(pAdapter)))
+         {
+              hdd_station_ctx_t *pHddStaCtx = &(pAdapter)->sessionCtx.station;
+              eHalStatus status = eHAL_STATUS_SUCCESS;
+@@ -7278,17 +7294,6 @@ int hdd_setBand_helper(struct net_device *dev, tANI_U8* ptr)
+                 return (0 == lrc) ? -ETIMEDOUT : -EINTR;
+              }
+         }
+-
+-        hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DUE_TO_BAND_CHANGE);
+-        sme_ScanFlushResult(hHal, pAdapter->sessionId);
+-        if (eHAL_STATUS_SUCCESS != sme_SetFreqBand(hHal, (eCsrBand)band))
+-        {
+-             VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_FATAL,
+-                     "%s: failed to set the band value to %u ",
+-                        __func__, band);
+-             return -EINVAL;
+-        }
+-        wlan_hdd_cfg80211_update_band(pHddCtx->wiphy, (eCsrBand)band);
+     }
+     return 0;
+ }
+diff --git a/CORE/SME/inc/csrInternal.h b/CORE/SME/inc/csrInternal.h
+index 5760159..aa83d05 100644
+--- a/CORE/SME/inc/csrInternal.h
++++ b/CORE/SME/inc/csrInternal.h
+@@ -411,6 +411,8 @@ typedef struct tagScanCmd
+         tCsrScanRequest   scanRequest;
+         tCsrBGScanRequest bgScanRequest;
+     }u;
++    //This flag will be set while aborting the scan due to band change
++    tANI_BOOLEAN            abortScanDueToBandChange;
+ }tScanCmd;
+ 
+ typedef struct tagRoamCmd
+diff --git a/CORE/SME/src/csr/csrApiScan.c b/CORE/SME/src/csr/csrApiScan.c
+index 3de5132..6dc3d29 100644
+--- a/CORE/SME/src/csr/csrApiScan.c
++++ b/CORE/SME/src/csr/csrApiScan.c
+@@ -4500,6 +4500,27 @@ tANI_BOOLEAN csrScanComplete( tpAniSirGlobal pMac, tSirSmeScanRsp *pScanRsp )
+                 //This check only valid here because csrSaveScanresults is not yet called
+                 fSuccess = (!csrLLIsListEmpty(&pMac->scan.tempScanResults, LL_ACCESS_LOCK));
+             }
++            if (pCommand->u.scanCmd.abortScanDueToBandChange)
++            {
++                /*
++                 * Scan aborted due to band change
++                 * The scan results need to be flushed
++                 */
++                if (pCommand->u.scanCmd.callback
++                    != pMac->scan.callback11dScanDone)
++                {
++                    smsLog(pMac, LOG1, FL("Filtering the scan results as the "
++                                          "results may belong to wrong band"));
++                    csrScanFilterResults(pMac);
++                }
++                else
++                {
++                    smsLog(pMac, LOG1, FL("11d_scan_done will flush the scan"
++                                          " results"));
++                }
++                pCommand->u.scanCmd.abortScanDueToBandChange
++                    = eANI_BOOLEAN_FALSE;
++            }
+             csrSaveScanResults(pMac, pCommand->u.scanCmd.reason);
+ 
+ #ifdef FEATURE_WLAN_DIAG_SUPPORT_CSR
+@@ -7745,6 +7766,11 @@ eHalStatus csrScanAbortMacScan(tpAniSirGlobal pMac, eCsrAbortReason reason)
+             status = palAllocateMemory(pMac->hHdd, (void **)&pMsg, msgLen);
+             if(HAL_STATUS_SUCCESS(status))
+             {
++                if(reason == eCSR_SCAN_ABORT_DUE_TO_BAND_CHANGE)
++                {
++                    pCommand->u.scanCmd.abortScanDueToBandChange
++                        = eANI_BOOLEAN_TRUE;
++                }
+                 palZeroMemory(pMac->hHdd, (void *)pMsg, msgLen);
+                 pMsg->type = pal_cpu_to_be16((tANI_U16)eWNI_SME_SCAN_ABORT_IND);
+                 pMsg->msgLen = pal_cpu_to_be16(msgLen);
+-- 
+1.8.2.1
+

@@ -1,0 +1,327 @@
+From dff8116adae6cc2d56bc3b1e5ad94f57137427c6 Mon Sep 17 00:00:00 2001
+From: Dasari Srinivas <dasaris@codeaurora.org>
+Date: Fri, 7 Feb 2014 11:13:45 +0530
+Subject: [PATCH] wlan: Reason code for scan abort.
+
+Add a reason code for scan abort. Currently , this is required to
+know if the abort is because of a band change. It can be enhanced
+further to cater the requirements.
+
+Change-Id: I641f36245d881b4f2cba70223f0abf90edd55b28
+CRs-Fixed: 592516
+
+diff --git a/CORE/HDD/inc/wlan_hdd_main.h b/CORE/HDD/inc/wlan_hdd_main.h
+index 61f4541..1de6584 100644
+--- a/CORE/HDD/inc/wlan_hdd_main.h
++++ b/CORE/HDD/inc/wlan_hdd_main.h
+@@ -1330,7 +1330,7 @@ tVOS_CON_MODE hdd_get_conparam( void );
+ void wlan_hdd_enable_deepsleep(v_VOID_t * pVosContext);
+ v_BOOL_t hdd_is_apps_power_collapse_allowed(hdd_context_t* pHddCtx);
+ v_BOOL_t hdd_is_suspend_notify_allowed(hdd_context_t* pHddCtx);
+-void hdd_abort_mac_scan(hdd_context_t *pHddCtx);
++void hdd_abort_mac_scan(hdd_context_t *pHddCtx, eCsrAbortReason reason);
+ void wlan_hdd_set_monitor_tx_adapter( hdd_context_t *pHddCtx, hdd_adapter_t *pAdapter );
+ void hdd_cleanup_actionframe( hdd_context_t *pHddCtx, hdd_adapter_t *pAdapter );
+ 
+diff --git a/CORE/HDD/src/wlan_hdd_cfg80211.c b/CORE/HDD/src/wlan_hdd_cfg80211.c
+index 9d6085f..5d39d6e 100644
+--- a/CORE/HDD/src/wlan_hdd_cfg80211.c
++++ b/CORE/HDD/src/wlan_hdd_cfg80211.c
+@@ -2402,7 +2402,7 @@ static int wlan_hdd_cfg80211_stop_ap (struct wiphy *wiphy,
+     if ((pScanInfo != NULL) && pScanInfo->mScanPending && staAdapter)
+     {
+         INIT_COMPLETION(pScanInfo->abortscan_event_var);
+-        hdd_abort_mac_scan(staAdapter->pHddCtx);
++        hdd_abort_mac_scan(staAdapter->pHddCtx, eCSR_SCAN_ABORT_DEFAULT);
+         status = wait_for_completion_interruptible_timeout(
+                            &pScanInfo->abortscan_event_var,
+                            msecs_to_jiffies(WLAN_WAIT_TIME_ABORTSCAN));
+@@ -6109,9 +6109,9 @@ static int wlan_hdd_cfg80211_disconnect( struct wiphy *wiphy,
+             pScanInfo =  &pHddCtx->scan_info;
+             if (pScanInfo->mScanPending)
+             {
+-               hddLog(VOS_TRACE_LEVEL_INFO, "Disconnect is in progress, "
++                hddLog(VOS_TRACE_LEVEL_INFO, "Disconnect is in progress, "
+                               "Aborting Scan");
+-                hdd_abort_mac_scan(pHddCtx);
++                hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DEFAULT);
+             }
+ 
+ #ifdef FEATURE_WLAN_TDLS
+diff --git a/CORE/HDD/src/wlan_hdd_hostapd.c b/CORE/HDD/src/wlan_hdd_hostapd.c
+index 00f3283..24f7b49 100644
+--- a/CORE/HDD/src/wlan_hdd_hostapd.c
++++ b/CORE/HDD/src/wlan_hdd_hostapd.c
+@@ -1257,7 +1257,7 @@ VOS_STATUS hdd_hostapd_SAPEventCB( tpSap_Event pSapEvent, v_PVOID_t usrDataForCa
+             // Lets do abort scan to ensure smooth authentication for client
+             if ((pScanInfo != NULL) && pScanInfo->mScanPending)
+             {
+-                hdd_abort_mac_scan(pHddCtx);
++                hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DEFAULT);
+             }
+ 
+             break;
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index 6d8d915..e4a1ad8 100644
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -297,7 +297,8 @@ static int hdd_netdev_notifier_call(struct notifier_block * nb,
+         { 
+            int result;
+            INIT_COMPLETION(pHddCtx->scan_info.abortscan_event_var);
+-           hdd_abort_mac_scan(pAdapter->pHddCtx);
++           hdd_abort_mac_scan(pAdapter->pHddCtx,
++                              eCSR_SCAN_ABORT_DEFAULT);
+            result = wait_for_completion_interruptible_timeout(
+                                &pHddCtx->scan_info.abortscan_event_var,
+                                msecs_to_jiffies(WLAN_WAIT_TIME_ABORTSCAN));
+@@ -6157,7 +6158,7 @@ VOS_STATUS hdd_stop_adapter( hdd_context_t *pHddCtx, hdd_adapter_t *pAdapter )
+          }
+          else
+          {
+-            hdd_abort_mac_scan(pHddCtx);
++            hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DEFAULT);
+          }
+ #ifdef WLAN_NS_OFFLOAD
+ #ifdef WLAN_OPEN_SOURCE
+@@ -7139,7 +7140,7 @@ void hdd_wlan_exit(hdd_context_t *pHddCtx)
+    // all scans will be cancelled.
+    if (NULL != pAdapter)
+    {
+-      hdd_abort_mac_scan( pHddCtx);
++      hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DEFAULT);
+    }
+    else
+    {
+diff --git a/CORE/HDD/src/wlan_hdd_p2p.c b/CORE/HDD/src/wlan_hdd_p2p.c
+index 14e207d..07c5fae 100644
+--- a/CORE/HDD/src/wlan_hdd_p2p.c
++++ b/CORE/HDD/src/wlan_hdd_p2p.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+  *
+  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
+  *
+diff --git a/CORE/HDD/src/wlan_hdd_scan.c b/CORE/HDD/src/wlan_hdd_scan.c
+index dd076b6..99a0b00 100644
+--- a/CORE/HDD/src/wlan_hdd_scan.c
++++ b/CORE/HDD/src/wlan_hdd_scan.c
+@@ -1167,8 +1167,8 @@ exit_point:
+ }
+ 
+ /* Abort any MAC scan if in progress */
+-void hdd_abort_mac_scan(hdd_context_t* pHddCtx)
++void hdd_abort_mac_scan(hdd_context_t* pHddCtx, eCsrAbortReason reason)
+ {
+-    sme_AbortMacScan(pHddCtx->hHal);
++    sme_AbortMacScan(pHddCtx->hHal, reason);
+ }
+ 
+diff --git a/CORE/HDD/src/wlan_hdd_wext.c b/CORE/HDD/src/wlan_hdd_wext.c
+index 8eced93..d8b2967 100644
+--- a/CORE/HDD/src/wlan_hdd_wext.c
++++ b/CORE/HDD/src/wlan_hdd_wext.c
+@@ -7177,7 +7177,7 @@ int hdd_setBand_helper(struct net_device *dev, tANI_U8* ptr)
+              }
+         }
+ 
+-        hdd_abort_mac_scan(pHddCtx);
++        hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DUE_TO_BAND_CHANGE);
+         sme_ScanFlushResult(hHal, pAdapter->sessionId);
+         if (eHAL_STATUS_SUCCESS != sme_SetFreqBand(hHal, (eCsrBand)band))
+         {
+diff --git a/CORE/SME/inc/csrApi.h b/CORE/SME/inc/csrApi.h
+index 955282a..e8137a0 100644
+--- a/CORE/SME/inc/csrApi.h
++++ b/CORE/SME/inc/csrApi.h
+@@ -202,6 +202,16 @@ typedef enum
+    eCSR_SCAN_FOUND_PEER,
+ }eCsrScanStatus;
+ 
++/* Reason to abort the scan
++ * The reason can used later to decide whether to update the scan results
++ * to upper layer or not
++ */
++typedef enum
++{
++    eCSR_SCAN_ABORT_DEFAULT,
++    eCSR_SCAN_ABORT_DUE_TO_BAND_CHANGE, //Scan aborted due to band change
++}eCsrAbortReason;
++
+ #define CSR_SCAN_TIME_DEFAULT       0
+ #define CSR_VALUE_IGNORED           0xFFFFFFFF
+ #define CSR_RSN_PMKID_SIZE          16
+diff --git a/CORE/SME/inc/sme_Api.h b/CORE/SME/inc/sme_Api.h
+index ae53a8f..f98cb35 100644
+--- a/CORE/SME/inc/sme_Api.h
++++ b/CORE/SME/inc/sme_Api.h
+@@ -1873,17 +1873,6 @@ eHalStatus sme_SetHostOffload (tHalHandle hHal, tANI_U8 sessionId,
+ eHalStatus sme_SetKeepAlive (tHalHandle hHal, tANI_U8 sessionId,
+                                   tpSirKeepAliveReq pRequest);
+ 
+-
+-/* ---------------------------------------------------------------------------
+-    \fn sme_AbortMacScan
+-    \brief  API to cancel MAC scan.
+-    \param  hHal - The handle returned by macOpen.
+-    \return VOS_STATUS
+-            VOS_STATUS_E_FAILURE - failure
+-            VOS_STATUS_SUCCESS  success
+-  ---------------------------------------------------------------------------*/
+-eHalStatus sme_AbortMacScan(tHalHandle hHal);
+-
+ /* ----------------------------------------------------------------------------
+    \fn sme_GetOperationChannel
+    \brief API to get current channel on which STA is parked
+@@ -2068,7 +2057,7 @@ tANI_U8 sme_GetConcurrentOperationChannel( tHalHandle hHal );
+             VOS_STATUS_E_FAILURE - failure
+             VOS_STATUS_SUCCESS  success
+   ---------------------------------------------------------------------------*/
+-eHalStatus sme_AbortMacScan(tHalHandle hHal);
++eHalStatus sme_AbortMacScan(tHalHandle hHal, eCsrAbortReason reason);
+ 
+ /* ---------------------------------------------------------------------------
+     \fn sme_GetCfgValidChannels
+diff --git a/CORE/SME/src/csr/csrApiRoam.c b/CORE/SME/src/csr/csrApiRoam.c
+index 4bd8251..93e686c 100644
+--- a/CORE/SME/src/csr/csrApiRoam.c
++++ b/CORE/SME/src/csr/csrApiRoam.c
+@@ -6380,7 +6380,7 @@ eHalStatus csrRoamConnect(tpAniSirGlobal pMac, tANI_U32 sessionId, tCsrRoamProfi
+     csrScanRemoveFreshScanCommand(pMac, sessionId);
+     csrScanCancelIdleScan(pMac);
+     //Only abort the scan if it is not used for other roam/connect purpose
+-    csrScanAbortMacScan(pMac);
++    csrScanAbortMacScan(pMac, eCSR_SCAN_ABORT_DEFAULT);
+     if (!vos_concurrent_sessions_running() && (VOS_STA_SAP_MODE == pProfile->csrPersona))//In case of AP mode we do not want idle mode scan
+     {
+         csrScanDisable(pMac);
+@@ -10056,7 +10056,7 @@ void csrRoamCancelRoaming(tpAniSirGlobal pMac, tANI_U32 sessionId)
+             //Roaming is stopped after here 
+             csrRoamCompleteRoaming(pMac, sessionId, eANI_BOOLEAN_TRUE, roamResult);
+             //Since CSR may be in lostlink roaming situation, abort all roaming related activities
+-            csrScanAbortMacScan(pMac);
++            csrScanAbortMacScan(pMac, eCSR_SCAN_ABORT_DEFAULT);
+             csrRoamStopRoamingTimer(pMac, sessionId);
+         }
+     }
+diff --git a/CORE/SME/src/csr/csrApiScan.c b/CORE/SME/src/csr/csrApiScan.c
+index 78eedd8..d57d662 100644
+--- a/CORE/SME/src/csr/csrApiScan.c
++++ b/CORE/SME/src/csr/csrApiScan.c
+@@ -7608,7 +7608,7 @@ eHalStatus csrProcessSetBGScanParam(tpAniSirGlobal pMac, tSmeCmd *pCommand)
+ }
+ 
+ 
+-eHalStatus csrScanAbortMacScan(tpAniSirGlobal pMac)
++eHalStatus csrScanAbortMacScan(tpAniSirGlobal pMac, eCsrAbortReason reason)
+ {
+     eHalStatus status = eHAL_STATUS_SUCCESS;
+     tSirMbMsg *pMsg;
+@@ -7711,7 +7711,7 @@ eHalStatus csrScanAbortMacScanNotForConnect(tpAniSirGlobal pMac)
+     if( !csrIsScanForRoamCommandActive( pMac ) )
+     {
+         //Only abort the scan if it is not used for other roam/connect purpose
+-        status = csrScanAbortMacScan(pMac);
++        status = csrScanAbortMacScan(pMac, eCSR_SCAN_ABORT_DEFAULT);
+     }
+ 
+     return (status);
+diff --git a/CORE/SME/src/csr/csrInsideApi.h b/CORE/SME/src/csr/csrInsideApi.h
+index b121340..846d3ad 100644
+--- a/CORE/SME/src/csr/csrInsideApi.h
++++ b/CORE/SME/src/csr/csrInsideApi.h
+@@ -282,7 +282,7 @@ void csrScanStopTimers(tpAniSirGlobal pMac);
+ tANI_BOOLEAN csrScanRemoveNotRoamingScanCommand(tpAniSirGlobal pMac);
+ //To remove fresh scan commands from the pending queue
+ tANI_BOOLEAN csrScanRemoveFreshScanCommand(tpAniSirGlobal pMac, tANI_U8 sessionId);
+-eHalStatus csrScanAbortMacScan(tpAniSirGlobal pMac);
++eHalStatus csrScanAbortMacScan(tpAniSirGlobal pMac, eCsrAbortReason reason);
+ void csrRemoveCmdFromPendingList(tpAniSirGlobal pMac, tDblLinkList *pList, 
+                                               eSmeCommandType commandType );
+ eHalStatus csrScanAbortMacScanNotForConnect(tpAniSirGlobal pMac);
+diff --git a/CORE/SME/src/csr/csrNeighborRoam.c b/CORE/SME/src/csr/csrNeighborRoam.c
+index 66e4a1a..88186f8 100644
+--- a/CORE/SME/src/csr/csrNeighborRoam.c
++++ b/CORE/SME/src/csr/csrNeighborRoam.c
+@@ -632,7 +632,7 @@ static void csrNeighborRoamResetCfgListChanScanControlInfo(tpAniSirGlobal pMac)
+         /* Abort any ongoing scan */
+         if (eANI_BOOLEAN_TRUE == pNeighborRoamInfo->scanRspPending)
+         {
+-                csrScanAbortMacScan(pMac);
++            csrScanAbortMacScan(pMac, eCSR_SCAN_ABORT_DEFAULT);
+         }
+         pNeighborRoamInfo->scanRspPending = eANI_BOOLEAN_FALSE;
+ 
+diff --git a/CORE/SME/src/p2p/p2p_Api.c b/CORE/SME/src/p2p/p2p_Api.c
+index d51e855..0ced684 100644
+--- a/CORE/SME/src/p2p/p2p_Api.c
++++ b/CORE/SME/src/p2p/p2p_Api.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+  *
+  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
+  *
+@@ -1163,7 +1163,7 @@ eHalStatus p2pCreateActionFrame(tpAniSirGlobal pMac, tANI_U8 SessionID, void *p2
+       return eHAL_STATUS_FAILURE;
+    }
+ 
+-   csrScanAbortMacScan(pMac);
++   csrScanAbortMacScan(pMac, eCSR_SCAN_ABORT_DEFAULT);
+ 
+    switch (actionFrameType)
+    {
+diff --git a/CORE/SME/src/sme_common/sme_Api.c b/CORE/SME/src/sme_common/sme_Api.c
+index 51f6ff8..3ae5b05 100644
+--- a/CORE/SME/src/sme_common/sme_Api.c
++++ b/CORE/SME/src/sme_common/sme_Api.c
+@@ -6383,11 +6383,12 @@ eHalStatus sme_SetPowerParams(tHalHandle hHal, tSirSetPowerParamsReq* pwParams,
+     \fn sme_AbortMacScan
+     \brief  API to cancel MAC scan.
+     \param  hHal - The handle returned by macOpen.
++    \param  reason - Reason to abort the scan.
+     \return VOS_STATUS
+             VOS_STATUS_E_FAILURE - failure
+             VOS_STATUS_SUCCESS  success
+   ---------------------------------------------------------------------------*/
+-eHalStatus sme_AbortMacScan(tHalHandle hHal)
++eHalStatus sme_AbortMacScan(tHalHandle hHal, eCsrAbortReason reason)
+ {
+     eHalStatus status;
+     tpAniSirGlobal pMac = PMAC_STRUCT( hHal );
+@@ -6397,8 +6398,7 @@ eHalStatus sme_AbortMacScan(tHalHandle hHal)
+     status = sme_AcquireGlobalLock( &pMac->sme );
+     if ( HAL_STATUS_SUCCESS( status ) )
+     {
+-       status = csrScanAbortMacScan(pMac);
+-    
++       status = csrScanAbortMacScan(pMac, reason);
+        sme_ReleaseGlobalLock( &pMac->sme );
+     }
+     
+diff --git a/CORE/VOSS/src/vos_api.c b/CORE/VOSS/src/vos_api.c
+index b41760b..2133856 100644
+--- a/CORE/VOSS/src/vos_api.c
++++ b/CORE/VOSS/src/vos_api.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
++ * Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+  *
+  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
+  *
+@@ -1952,7 +1952,7 @@ void vos_abort_mac_scan(void)
+        return;
+     }
+ 
+-    hdd_abort_mac_scan(pHddCtx);
++    hdd_abort_mac_scan(pHddCtx, eCSR_SCAN_ABORT_DEFAULT);
+     return;
+ }
+ 
+-- 
+1.8.2.1
+
