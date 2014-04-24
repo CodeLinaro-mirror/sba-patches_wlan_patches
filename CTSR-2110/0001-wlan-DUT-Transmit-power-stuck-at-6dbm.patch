@@ -1,0 +1,60 @@
+From fdad984888fa40157b6cdc99b494d56b3e7599b0 Mon Sep 17 00:00:00 2001
+From: Sandeep Puligilla <spuligil@qti.qualcomm.com>
+Date: Tue, 22 Apr 2014 09:05:57 +0530
+Subject: [PATCH] wlan: DUT Transmit power stuck at 6dbm
+
+If local transmit power recieved as 0dbm then host is sending
+0dbm as max Tx power to firmware which causing Tx power
+to stuck at 6dbm.
+
+To avoid sending 0dbm to firmware added a additional check
+to take care of local power constraint value recieved as 0dbm.
+
+Change-Id: Ie3ec43f8748108e1cad4172cceb51822367e59d1
+CRs-Fixed: 648752
+---
+ CORE/MAC/src/pe/lim/limProcessSmeReqMessages.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/CORE/MAC/src/pe/lim/limProcessSmeReqMessages.c b/CORE/MAC/src/pe/lim/limProcessSmeReqMessages.c
+index da9a356..a7649c6 100644
+--- a/CORE/MAC/src/pe/lim/limProcessSmeReqMessages.c
++++ b/CORE/MAC/src/pe/lim/limProcessSmeReqMessages.c
+@@ -1856,7 +1856,6 @@ __limProcessSmeJoinReq(tpAniSirGlobal pMac, tANI_U32 *pMsgBuf)
+            psessionEntry->pLimJoinReq->bssDescription.capabilityInfo;
+ 
+         regMax = cfgGetRegulatoryMaxTransmitPower( pMac, psessionEntry->currentOperChannel ); 
+-        localPowerConstraint = regMax;
+         limExtractApCapability( pMac,
+            (tANI_U8 *) psessionEntry->pLimJoinReq->bssDescription.ieFields,
+            limGetIElenFromBssDescription(&psessionEntry->pLimJoinReq->bssDescription),
+@@ -1865,15 +1864,22 @@ __limProcessSmeJoinReq(tpAniSirGlobal pMac, tANI_U32 *pMsgBuf)
+            &pMac->lim.gLimCurrentBssUapsd //TBD-RAJESH  make gLimCurrentBssUapsd this session specific
+            , &localPowerConstraint,
+            psessionEntry
+-           ); 
++           );
++        /* If power constraint is zero then update it with Region max.
++                 MaxTxpower will be the MIN of regmax and power constraint */
++        if( localPowerConstraint == 0 )
++        {
++          localPowerConstraint = regMax;
++        }
+ #ifdef FEATURE_WLAN_CCX
+             psessionEntry->maxTxPower = limGetMaxTxPower(regMax, localPowerConstraint, pMac->roam.configParam.nTxPowerCap);
+ #else
+             psessionEntry->maxTxPower = VOS_MIN( regMax, (localPowerConstraint) );
+ #endif
+-#if defined WLAN_VOWIFI_DEBUG
+-        limLog( pMac, LOGE, "Regulatory max = %d, local power constraint = %d, max tx = %d", regMax, localPowerConstraint, psessionEntry->maxTxPower );
+-#endif
++        VOS_TRACE(VOS_MODULE_ID_PE, VOS_TRACE_LEVEL_INFO,
++                        "Regulatory max = %d, local power constraint = %d,"
++                        " max tx = %d", regMax, localPowerConstraint,
++                          psessionEntry->maxTxPower );
+ 
+         if (pMac->lim.gLimCurrentBssUapsd)
+         {
+-- 
+1.8.2.1
+
