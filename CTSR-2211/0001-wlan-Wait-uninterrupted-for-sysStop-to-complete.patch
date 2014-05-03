@@ -1,0 +1,61 @@
+From 96175df3069081a05ddc0ded596510143f1770c9 Mon Sep 17 00:00:00 2001
+From: Vinay Krishna Eranna <c_veran@qti.qualcomm.com>
+Date: Wed, 9 Apr 2014 21:32:08 +0530
+Subject: [PATCH] wlan: Wait uninterrupted for sysStop to complete
+
+During driver load on failure condition, sysStop is invoked which
+queues a command to stop MAC which eventually cleans up timers.
+After queueing of command sysStop waits for completion indication
+with interruptible status, which is getting interrupted with
+ERESTARTSYS leaving the gLimSendDisassocFrameThresholdTimer
+in active state, this is causing timer to be triggered after
+driver fails to load causing the crash.
+
+Wait for the completion indication with Uninterruptable state.
+
+Change-Id: Iba05cf4e035c24cf5278f08461520c0d45ad87d1
+CRs-Fixed: 638025
+---
+ CORE/HDD/src/wlan_hdd_main.c       | 2 +-
+ CORE/SYS/common/src/wlan_qct_sys.c | 5 +++--
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index 984eb1b..5a3755e 100644
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -5314,7 +5314,7 @@ VOS_STATUS hdd_init_station_mode( hdd_adapter_t *pAdapter )
+    }
+    
+    //Block on a completion variable. Can't wait forever though.
+-   rc = wait_for_completion_interruptible_timeout(
++   rc = wait_for_completion_timeout(
+                         &pAdapter->session_open_comp_var,
+                         msecs_to_jiffies(WLAN_WAIT_TIME_SESSIONOPENCLOSE));
+    if (!rc)
+diff --git a/CORE/SYS/common/src/wlan_qct_sys.c b/CORE/SYS/common/src/wlan_qct_sys.c
+index 10da2f8..0972258 100644
+--- a/CORE/SYS/common/src/wlan_qct_sys.c
++++ b/CORE/SYS/common/src/wlan_qct_sys.c
+@@ -114,7 +114,8 @@ typedef struct
+ 
+ } sysContextData;
+ 
+-
++// sysStop 20 Seconds timeout
++#define SYS_STOP_TIMEOUT 20000
+ static vos_event_t gStopEvt;
+ 
+ VOS_STATUS sysBuildMessageHeader( SYS_MSG_ID sysMsgId, vos_msg_t *pMsg )
+@@ -177,7 +178,7 @@ VOS_STATUS sysStop( v_CONTEXT_t pVosContext )
+       vosStatus = VOS_STATUS_E_BADMSG;
+    }
+ 
+-   vosStatus = vos_wait_events( &gStopEvt, 1, 0, &evtIndex );
++   vosStatus = vos_wait_events( &gStopEvt, 1, SYS_STOP_TIMEOUT, &evtIndex );
+    VOS_ASSERT( VOS_IS_STATUS_SUCCESS ( vosStatus ) );
+ 
+    vosStatus = vos_event_destroy( &gStopEvt );
+-- 
+1.8.2
+
