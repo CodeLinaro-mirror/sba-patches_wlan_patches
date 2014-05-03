@@ -1,0 +1,67 @@
+From 98d9472a26e8236ce97e6f58fb53640d35417965 Mon Sep 17 00:00:00 2001
+From: Abhishek Singh <absingh@qti.qualcomm.com>
+Date: Fri, 25 Apr 2014 13:33:07 +0530
+Subject: [PATCH] wlan: DUT not able to enter BMPS after the connection
+
+In csrRoamProcessResults remainInPowerActiveTillDHCP is set
+before the check pmcShouldBmpsTimerRun. Also if isAndroidPsEn
+is set in INI file the pmcShouldBmpsTimerRun returns false
+and hTrafficTimer is not started after the connection, thus
+the device does not enter BMPS.
+
+Set remainInPowerActiveTillDHCP after the check
+pmcShouldBmpsTimerRun to allow hTrafficTimer to run.
+
+CRs-Fixed: 654705
+Change-Id: I36b960fb79f7602c541cfbc513e6f7df99123d31
+
+Conflicts:
+	CORE/SME/src/sme_common/sme_Api.c
+---
+ CORE/SME/src/csr/csrApiRoam.c     | 11 +++++++++++
+ CORE/SME/src/sme_common/sme_Api.c |  7 +++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/CORE/SME/src/csr/csrApiRoam.c b/CORE/SME/src/csr/csrApiRoam.c
+index c3889c1..a74d518 100644
+--- a/CORE/SME/src/csr/csrApiRoam.c
++++ b/CORE/SME/src/csr/csrApiRoam.c
+@@ -5345,6 +5345,17 @@ static tANI_BOOLEAN csrRoamProcessResults( tpAniSirGlobal pMac, tSmeCmd *pComman
+             //enough to let security and DHCP handshake succeed before entry into BMPS
+             if (pmcShouldBmpsTimerRun(pMac))
+             {
++                /* Set remainInPowerActiveTillDHCP to make sure we wait for
++                 * until keys are set before going into BMPS.
++                 */
++                if(eANI_BOOLEAN_TRUE == roamInfo.fAuthRequired)
++                {
++                     pMac->pmc.remainInPowerActiveTillDHCP = TRUE;
++                     smsLog(pMac, LOG1, FL("Set remainInPowerActiveTillDHCP "
++                            "to make sure we wait until keys are set before"
++                            " going to BMPS"));
++                }
++
+                 if (pmcStartTrafficTimer(pMac, BMPS_TRAFFIC_TIMER_ALLOW_SECURITY_DHCP)
+                     != eHAL_STATUS_SUCCESS)
+                 {
+diff --git a/CORE/SME/src/sme_common/sme_Api.c b/CORE/SME/src/sme_common/sme_Api.c
+index c19e6d1..eea1b0f 100644
+--- a/CORE/SME/src/sme_common/sme_Api.c
++++ b/CORE/SME/src/sme_common/sme_Api.c
+@@ -4286,6 +4286,13 @@ eHalStatus sme_RoamSetKey(tHalHandle hHal, tANI_U8 sessionId, tCsrRoamSetKey *pS
+       smsLog(pMac, LOGE, FL("Invalid key length %d"), pSetKey->keyLength);
+       return eHAL_STATUS_FAILURE;
+    }
++   /*Once Setkey is done, we can go in BMPS*/
++   if(pSetKey->keyLength)
++   {
++     pMac->pmc.remainInPowerActiveTillDHCP = FALSE;
++     smsLog(pMac, LOG1, FL("Reset remainInPowerActiveTillDHCP"
++                           " to allow BMPS"));
++   }
+ 
+    status = sme_AcquireGlobalLock( &pMac->sme );
+    if ( HAL_STATUS_SUCCESS( status ) )
+-- 
+1.8.2.1
+
