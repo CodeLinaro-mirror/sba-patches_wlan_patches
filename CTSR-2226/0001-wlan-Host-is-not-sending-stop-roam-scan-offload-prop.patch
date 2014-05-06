@@ -1,0 +1,39 @@
+From dea3fb7112693d60dab912cc73e37a784ab577db Mon Sep 17 00:00:00 2001
+From: Mukul Sharma <mukul@qti.qualcomm.com>
+Date: Thu, 24 Apr 2014 13:24:12 +0530
+Subject: [PATCH] wlan: Host is not sending stop roam scan offload properly
+
+When Disconnect happen, Host need to send the stop roam
+scan offload (ROAM_SCAN_OFFLOAD_STOP) but due to recent
+changes(regression) host is issuing this cmd as ZERO
+(which is not a valid RSO cmd).
+
+Change-Id: Ie3f0407a6c867d14386d5ca83a956d2b8fef6eb3
+CRs-Fixed: 644688
+---
+ CORE/SME/src/csr/csrApiRoam.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CORE/SME/src/csr/csrApiRoam.c b/CORE/SME/src/csr/csrApiRoam.c
+index 95e4fda..edbd1ea 100644
+--- a/CORE/SME/src/csr/csrApiRoam.c
++++ b/CORE/SME/src/csr/csrApiRoam.c
+@@ -15289,6 +15289,7 @@ eHalStatus csrRoamOffloadScan(tpAniSirGlobal pMac, tANI_U8 command, tANI_U8 reas
+     vos_mem_zero(pRequestBuf,sizeof(tSirRoamOffloadScanReq));
+     /* If command is STOP, then pass down ScanOffloadEnabled as Zero.This will handle the case of
+      * host driver reloads, but Riva still up and running*/
++    pRequestBuf->Command = command;
+     if(command == ROAM_SCAN_OFFLOAD_STOP)
+     {
+        pRequestBuf->RoamScanOffloadEnabled = 0;
+@@ -15449,7 +15450,6 @@ eHalStatus csrRoamOffloadScan(tpAniSirGlobal pMac, tANI_U8 command, tANI_U8 reas
+                 pRequestBuf->LookupThreshold);
+     pRequestBuf->RoamRssiDiff =
+             pMac->roam.configParam.RoamRssiDiff;
+-    pRequestBuf->Command = command;
+     pRequestBuf->StartScanReason = reason;
+     pRequestBuf->NeighborScanTimerPeriod =
+             pNeighborRoamInfo->cfgParams.neighborScanPeriod;
+-- 
+1.8.2.1
+
