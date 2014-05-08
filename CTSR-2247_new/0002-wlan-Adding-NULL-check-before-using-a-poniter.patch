@@ -1,0 +1,32 @@
+From a8d078eab1de71a0dbc8b1935412b71aafec16d0 Mon Sep 17 00:00:00 2001
+From: Hanumantha Reddy Pothula <c_hpothu@codeaurora.org>
+Date: Fri, 18 Apr 2014 18:00:36 +0530
+Subject: [PATCH 2/2] wlan: Adding NULL check before using a poniter.
+
+Call WLANTL_AssocFailed() only when pRoamInfo is valid.
+
+Change-Id: I342abe6708b22a4fef3b8941338dbc83cafd03ed
+CRs-fixed: 650785
+---
+ CORE/HDD/src/wlan_hdd_assoc.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_assoc.c b/CORE/HDD/src/wlan_hdd_assoc.c
+index bfb629e..2fd987e 100644
+--- a/CORE/HDD/src/wlan_hdd_assoc.c
++++ b/CORE/HDD/src/wlan_hdd_assoc.c
+@@ -1499,7 +1499,10 @@ static eHalStatus hdd_AssociationCompletionHandler( hdd_adapter_t *pAdapter, tCs
+         /*Clear the roam profile*/
+         hdd_clearRoamProfileIe( pAdapter );
+ 
+-        WLANTL_AssocFailed(pRoamInfo->staId);
++        if (pRoamInfo)
++        {
++            WLANTL_AssocFailed(pRoamInfo->staId);
++        }
+ 
+         netif_tx_disable(dev);
+         netif_carrier_off(dev);
+-- 
+1.8.2
+
