@@ -1,0 +1,705 @@
+From f4c7ece51791a8d4091667aa9f90e0dc9057713c Mon Sep 17 00:00:00 2001
+From: Hanumantha Reddy Pothula <c_hpothu@codeaurora.org>
+Date: Tue, 6 May 2014 20:52:39 +0530
+Subject: [PATCH 2/2] wlan: Implemented ioctl to get beacon miss count.
+
+Implemented ioctl, GETBCNMISSRATE, which provides continuous beacon
+miss rate, from firmware.
+
+Change-Id: I596aad1d534e81c534a15bb25cd0d8785c79ae48
+CRs-Fixed: 656075.
+---
+ CORE/HDD/inc/wlan_hdd_main.h      |    7 ++
+ CORE/HDD/src/wlan_hdd_main.c      |   94 ++++++++++++++++++++
+ CORE/MAC/inc/sirApi.h             |   17 ++++
+ CORE/MAC/src/include/sirParams.h  |    1 +
+ CORE/SME/inc/sme_Api.h            |    3 +
+ CORE/SME/src/sme_common/sme_Api.c |   60 +++++++++++++
+ CORE/WDA/inc/wlan_qct_wda.h       |    2 +
+ CORE/WDA/src/wlan_qct_wda.c       |   72 +++++++++++++++
+ CORE/WDI/CP/inc/wlan_qct_wdi.h    |    8 ++
+ CORE/WDI/CP/inc/wlan_qct_wdi_i.h  |   17 ++++
+ CORE/WDI/CP/src/wlan_qct_wdi.c    |  174 ++++++++++++++++++++++++++++++++++++-
+ 11 files changed, 453 insertions(+), 2 deletions(-)
+
+diff --git a/CORE/HDD/inc/wlan_hdd_main.h b/CORE/HDD/inc/wlan_hdd_main.h
+index a4bf98e..e6c6d20 100644
+--- a/CORE/HDD/inc/wlan_hdd_main.h
++++ b/CORE/HDD/inc/wlan_hdd_main.h
+@@ -257,6 +257,7 @@ extern spinlock_t hdd_context_lock;
+ #define RSSI_CONTEXT_MAGIC  0x52535349   //RSSI
+ #define POWER_CONTEXT_MAGIC 0x504F5752   //POWR
+ #define SNR_CONTEXT_MAGIC   0x534E5200   //SNR
++#define BCN_MISS_RATE_CONTEXT_MAGIC 0x513F5753
+ 
+ #ifdef FEATURE_WLAN_BATCH_SCAN
+ #define HDD_BATCH_SCAN_VERSION (17)
+@@ -1052,6 +1053,12 @@ typedef struct
+ } lphbEnableStruct;
+ #endif /* FEATURE_WLAN_LPHB */
+ 
++typedef struct
++{
++   struct completion completion;
++   tANI_U32 magic;
++}bcnMissRateContext_t;
++
+ /** Adapter stucture definition */
+ 
+ struct hdd_context_s
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index 984eb1b..07c0939 100644
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -155,6 +155,8 @@ static struct kparam_string fwpath = {
+ static int wlan_hdd_inited;
+ #endif
+ 
++static int gbcnMissRate = -1;
++
+ /*
+  * spinlock for synchronizing asynchronous request/response
+  * (full description of use in wlan_hdd_main.h)
+@@ -191,6 +193,9 @@ static VOS_STATUS hdd_parse_ccx_beacon_req(tANI_U8 *pValue,
+ #define WLAN_HDD_DRIVER_MIRACAST_CFG_MIN_VAL 0
+ #define WLAN_HDD_DRIVER_MIRACAST_CFG_MAX_VAL 2
+ 
++//wait time for beacon miss rate.
++#define BCN_MISS_RATE_TIME 500
++
+ #ifdef WLAN_OPEN_SOURCE
+ static struct wake_lock wlan_wake_lock;
+ #endif
+@@ -1864,6 +1869,36 @@ exit:
+ 
+ #endif/*End of FEATURE_WLAN_BATCH_SCAN*/
+ 
++static void getBcnMissRateCB(VOS_STATUS status, int bcnMissRate, void *data)
++{
++    bcnMissRateContext_t *pCBCtx = (bcnMissRateContext_t *)data;
++
++   /* there is a race condition that exists between this callback
++      function and the caller since the caller could time out either
++      before or while this code is executing.  we use a spinlock to
++      serialize these actions */
++    spin_lock(&hdd_context_lock);
++
++    gbcnMissRate = -1;
++
++    if(pCBCtx->magic != BCN_MISS_RATE_CONTEXT_MAGIC || NULL == data)
++    {
++        hddLog(VOS_TRACE_LEVEL_ERROR,
++               FL("invalid context magic: %08x data: %p"), pCBCtx->magic, data );
++        spin_unlock(&hdd_context_lock);
++        return ;
++    }
++
++    if (VOS_STATUS_SUCCESS == status)
++    {
++       gbcnMissRate = bcnMissRate;
++    }
++    complete(&(pCBCtx->completion));
++    spin_unlock(&hdd_context_lock);
++
++    return;
++}
++
+ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ {
+    hdd_adapter_t *pAdapter = WLAN_HDD_GET_PRIV_PTR(dev);
+@@ -3696,6 +3731,65 @@ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+            ret = hdd_handle_batch_scan_ioctl(pAdapter, &priv_data, command);
+        }
+ #endif
++       else if (strncmp(command, "GETBCNMISSRATE", 14) == 0)
++       {
++           eHalStatus status;
++           char buf[32], len;
++           long waitRet;
++           bcnMissRateContext_t getBcnMissRateCtx;
++           hdd_station_ctx_t *pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
++
++           if (eConnectionState_Associated != pHddStaCtx->conn_info.connState)
++           {
++               hddLog(VOS_TRACE_LEVEL_WARN,
++                    FL("GETBCNMISSRATE: STA is not in connected state"));
++               ret = -1;
++               goto exit;
++           }
++
++           init_completion(&(getBcnMissRateCtx.completion));
++           getBcnMissRateCtx.magic = BCN_MISS_RATE_CONTEXT_MAGIC;
++
++           status = sme_getBcnMissRate((tHalHandle)(pHddCtx->hHal),
++                                       pAdapter->sessionId,
++                                       (void *)getBcnMissRateCB,
++                                       (void *)(&getBcnMissRateCtx));
++           if( eHAL_STATUS_SUCCESS != status)
++           {
++               hddLog(VOS_TRACE_LEVEL_INFO,
++                    FL("GETBCNMISSRATE: fail to post WDA cmd"));
++                ret = -EINVAL;
++                goto exit;
++           }
++
++           waitRet = wait_for_completion_interruptible_timeout
++                           (&getBcnMissRateCtx.completion, BCN_MISS_RATE_TIME);
++           if(waitRet <= 0)
++           {
++               hddLog(VOS_TRACE_LEVEL_ERROR,
++                         FL("failed to wait on bcnMissRateComp %d"), ret);
++
++               //Make magic number to zero so that callback is not called.
++               spin_lock(&hdd_context_lock);
++               getBcnMissRateCtx.magic = 0x0;
++               spin_unlock(&hdd_context_lock);
++               ret = -EINVAL;
++               goto exit;
++           }
++
++           hddLog(VOS_TRACE_LEVEL_INFO,
++                  FL("GETBCNMISSRATE: bcnMissRate: %d"), gbcnMissRate);
++
++           len = snprintf(buf, sizeof(buf), "GETBCNMISSRATE %d", gbcnMissRate);
++           if (copy_to_user(priv_data.buf, &buf, len + 1))
++           {
++               hddLog(VOS_TRACE_LEVEL_ERROR,
++                     "%s: failed to copy data to user buffer", __func__);
++               ret = -EFAULT;
++               goto exit;
++           }
++           ret = len;
++       }
+        else {
+            hddLog( VOS_TRACE_LEVEL_WARN, "%s: Unsupported GUI command %s",
+                    __func__, command);
+diff --git a/CORE/MAC/inc/sirApi.h b/CORE/MAC/inc/sirApi.h
+index a67dd8f..07a3333 100644
+--- a/CORE/MAC/inc/sirApi.h
++++ b/CORE/MAC/inc/sirApi.h
+@@ -4608,4 +4608,21 @@ typedef struct sSirChAvoidIndType
+ } tSirChAvoidIndType;
+ #endif /* FEATURE_WLAN_CH_AVOID */
+ 
++typedef void (*pGetBcnMissRateCB)( tANI_S32 bcnMissRate,
++                                   VOS_STATUS status, void *data);
++
++typedef PACKED_PRE struct PACKED_POST
++{
++   tANI_U32   msgLen;
++   tANI_U8    bssid[WNI_CFG_BSSID_LEN];
++   void      *callback;
++   void      *data;
++}tSirBcnMissRateReq;
++
++typedef PACKED_PRE struct PACKED_POST
++{
++    pGetBcnMissRateCB callback;
++    void             *data;
++}tSirBcnMissRateInfo;
++
+ #endif /* __SIR_API_H */
+diff --git a/CORE/MAC/src/include/sirParams.h b/CORE/MAC/src/include/sirParams.h
+index 10b2057..4b84523 100644
+--- a/CORE/MAC/src/include/sirParams.h
++++ b/CORE/MAC/src/include/sirParams.h
+@@ -612,6 +612,7 @@ typedef struct sSirMbMsgP2p
+ #define SIR_HAL_TRIGGER_BATCH_SCAN_RESULT_IND (SIR_HAL_ITC_MSG_TYPES_BEGIN + 213)
+ #endif
+ 
++#define SIR_HAL_BCN_MISS_RATE_REQ         (SIR_HAL_ITC_MSG_TYPES_BEGIN + 214)
+ 
+ #define SIR_HAL_MSG_TYPES_END              (SIR_HAL_ITC_MSG_TYPES_BEGIN + 0xFF)
+ // CFG message types
+diff --git a/CORE/SME/inc/sme_Api.h b/CORE/SME/inc/sme_Api.h
+index f3b13b9..3417df7 100644
+--- a/CORE/SME/inc/sme_Api.h
++++ b/CORE/SME/inc/sme_Api.h
+@@ -3171,4 +3171,7 @@ eHalStatus sme_AddChAvoidCallback
+    void (*pCallbackfn)(void *pAdapter, void *indParam)
+ );
+ #endif /* FEATURE_WLAN_CH_AVOID */
++
++eHalStatus sme_getBcnMissRate(tHalHandle, tANI_U8, void *, void *);
++
+ #endif //#if !defined( __SME_API_H )
+diff --git a/CORE/SME/src/sme_common/sme_Api.c b/CORE/SME/src/sme_common/sme_Api.c
+index c19e6d1..e1ac895 100644
+--- a/CORE/SME/src/sme_common/sme_Api.c
++++ b/CORE/SME/src/sme_common/sme_Api.c
+@@ -1763,6 +1763,66 @@ eHalStatus sme_SetCcxBeaconRequest(tHalHandle hHal, const tANI_U8 sessionId,
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ 
+ 
++/* ---------------------------------------------------------------------------
++    \fn sme_getBcnMissRate
++    \brief function sends 'WDA_GET_BCN_MISS_RATE_REQ' to WDA layer,
++    \param  hHal - HAL handle for device.
++    \param  sessionId - session ID.
++    \- return Success or Failure.
++    -------------------------------------------------------------------------*/
++
++eHalStatus sme_getBcnMissRate(tHalHandle hHal, tANI_U8 sessionId, void *callback, void *data)
++{
++    tpAniSirGlobal pMac = PMAC_STRUCT( hHal );
++    VOS_STATUS vosStatus = VOS_STATUS_E_FAILURE;
++    vos_msg_t vosMessage;
++    tSirBcnMissRateReq *pMsg;
++    tCsrRoamSession *pSession;
++
++    if ( eHAL_STATUS_SUCCESS ==  sme_AcquireGlobalLock( &pMac->sme  ) )
++    {
++        pSession = CSR_GET_SESSION( pMac, sessionId );
++
++        if (!pSession)
++        {
++            smsLog(pMac, LOGE, FL("session %d not found"), sessionId);
++            sme_ReleaseGlobalLock( &pMac->sme );
++            return eHAL_STATUS_FAILURE;
++        }
++
++        pMsg = (tSirBcnMissRateReq *) vos_mem_malloc(sizeof(tSirTxPerTrackingParam));
++        if (NULL == pMsg)
++        {
++            smsLog(pMac, LOGE, FL("failed to allocated memory"));
++            sme_ReleaseGlobalLock( &pMac->sme );
++            return eHAL_STATUS_FAILURE;
++        }
++
++        vos_mem_copy(pMsg->bssid, pSession->connectedProfile.bssid,
++                 sizeof(tSirMacAddr));
++
++        pMsg->msgLen   = sizeof(tSirBcnMissRateReq);
++        pMsg->callback = callback;
++        pMsg->data     = data;
++
++        vosMessage.type = WDA_GET_BCN_MISS_RATE_REQ;
++        vosMessage.bodyptr = pMsg;
++        vosMessage.reserved = 0;
++        vosStatus = vos_mq_post_message( VOS_MQ_ID_WDA, &vosMessage );
++        if ( !VOS_IS_STATUS_SUCCESS(vosStatus) )
++        {
++           VOS_TRACE(VOS_MODULE_ID_SME, VOS_TRACE_LEVEL_ERROR,
++                     "%s: Post Set TM Level MSG fail", __func__);
++           vos_mem_free(pMsg);
++           sme_ReleaseGlobalLock( &pMac->sme );
++           return eHAL_STATUS_FAILURE;
++        }
++        sme_ReleaseGlobalLock( &pMac->sme);
++        return eHAL_STATUS_SUCCESS;
++    }
++    return eHAL_STATUS_FAILURE;
++}
++
+ /*--------------------------------------------------------------------------
+ 
+   \brief sme_ProcessMsg() - The main message processor for SME.
+diff --git a/CORE/WDA/inc/wlan_qct_wda.h b/CORE/WDA/inc/wlan_qct_wda.h
+index 2d6aea4..3a04853 100644
+--- a/CORE/WDA/inc/wlan_qct_wda.h
++++ b/CORE/WDA/inc/wlan_qct_wda.h
+@@ -1114,6 +1114,8 @@ tSirRetStatus uMacPostCtrlMsg(void* pSirGlobal, tSirMbMsg* pMb);
+ #define WDA_TRIGGER_BATCH_SCAN_RESULT_IND SIR_HAL_TRIGGER_BATCH_SCAN_RESULT_IND
+ #endif
+ 
++#define WDA_GET_BCN_MISS_RATE_REQ        SIR_HAL_BCN_MISS_RATE_REQ
++
+ tSirRetStatus wdaPostCtrlMsg(tpAniSirGlobal pMac, tSirMsgQ *pMsg);
+ 
+ eHalStatus WDA_SetRegDomain(void * clientCtxt, v_REGDOMAIN_t regId,
+diff --git a/CORE/WDA/src/wlan_qct_wda.c b/CORE/WDA/src/wlan_qct_wda.c
+index 177e380..0f187ba 100644
+--- a/CORE/WDA/src/wlan_qct_wda.c
++++ b/CORE/WDA/src/wlan_qct_wda.c
+@@ -219,6 +219,9 @@ static VOS_STATUS WDA_ProcessGTKOffloadReq(tWDA_CbContext *pWDA, tpSirGtkOffload
+ static VOS_STATUS WDA_ProcessGTKOffloadGetInfoReq(tWDA_CbContext *pWDA, tpSirGtkOffloadGetInfoRspParams pGtkOffloadGetInfoRsp);
+ #endif // WLAN_FEATURE_GTK_OFFLOAD
+ 
++v_VOID_t WDA_ProcessGetBcnMissRateReq(tWDA_CbContext *pWDA,
++                                      tSirBcnMissRateReq *pData);
++
+ VOS_STATUS WDA_ProcessSetTmLevelReq(tWDA_CbContext *pWDA,
+                                     tAniSetTmLevelReq *setTmLevelReq);
+ #ifdef WLAN_FEATURE_11AC
+@@ -11917,6 +11920,10 @@ VOS_STATUS WDA_McProcessMsg( v_CONTEXT_t pVosContext, vos_msg_t *pMsg )
+           break;
+       }
+ #endif
++      case WDA_GET_BCN_MISS_RATE_REQ:
++          WDA_ProcessGetBcnMissRateReq(pWDA,
++                                      (tSirBcnMissRateReq *)pMsg->bodyptr);
++          break;
+ 
+       default:
+       {
+@@ -14958,3 +14965,68 @@ VOS_STATUS WDA_ProcessLPHBConfReq(tWDA_CbContext *pWDA,
+ }
+ #endif /* FEATURE_WLAN_LPHB */
+ 
++void WDA_GetBcnMissRateCallback(tANI_U8 status, tANI_U32 bcnMissRate,
++                                void* pUserData)
++{
++   tSirBcnMissRateInfo *pBcnMissRateInfo = (tSirBcnMissRateInfo *)pUserData;
++
++   VOS_TRACE( VOS_MODULE_ID_WDA, VOS_TRACE_LEVEL_INFO,
++                                          "<------ %s " ,__func__);
++   if (NULL == pBcnMissRateInfo)
++   {
++      VOS_TRACE( VOS_MODULE_ID_WDA, VOS_TRACE_LEVEL_ERROR,
++                "%s: pWdaParams received NULL", __func__);
++      VOS_ASSERT(0) ;
++      return ;
++   }
++   if (pBcnMissRateInfo->callback)
++   {
++       pBcnMissRateInfo->callback(status, bcnMissRate,
++                                  pBcnMissRateInfo->data);
++   }
++   vos_mem_free(pUserData);
++
++   return;
++}
++
++v_VOID_t WDA_ProcessGetBcnMissRateReq(tWDA_CbContext *pWDA,
++                                      tSirBcnMissRateReq *pData)
++{
++   WDI_Status wdiStatus;
++   tSirBcnMissRateInfo *pBcnMissRateInfo;
++
++   VOS_TRACE(VOS_MODULE_ID_WDA, VOS_TRACE_LEVEL_INFO,
++             "------> %s " , __func__);
++
++   pBcnMissRateInfo =
++              (tSirBcnMissRateInfo *)vos_mem_malloc(sizeof(tSirBcnMissRateInfo));
++   if (NULL == pBcnMissRateInfo)
++   {
++      VOS_TRACE(VOS_MODULE_ID_WDA, VOS_TRACE_LEVEL_ERROR,
++                "%s: VOS MEM Alloc Failure", __func__);
++      VOS_ASSERT(0);
++      vos_mem_free(pData);
++      return;
++   }
++
++   pBcnMissRateInfo->callback = (pGetBcnMissRateCB)(pData->callback);
++   pBcnMissRateInfo->data     = pData->data;
++
++   wdiStatus = WDI_GetBcnMissRate(pBcnMissRateInfo,
++                                  WDA_GetBcnMissRateCallback,
++                                  pData->bssid);
++   if (WDI_STATUS_PENDING == wdiStatus)
++   {
++      VOS_TRACE(VOS_MODULE_ID_WDA, VOS_TRACE_LEVEL_INFO,
++              "Pending received for %s:%d ", __func__, __LINE__);
++   }
++   else if (WDI_STATUS_SUCCESS != wdiStatus)
++   {
++       if (pBcnMissRateInfo->callback)
++       {
++           pBcnMissRateInfo->callback(VOS_STATUS_E_FAILURE,
++                                      -1, pBcnMissRateInfo->data);
++       }
++   }
++   vos_mem_free(pData);
++}
+diff --git a/CORE/WDI/CP/inc/wlan_qct_wdi.h b/CORE/WDI/CP/inc/wlan_qct_wdi.h
+index ae05cf4..8a073fa 100644
+--- a/CORE/WDI/CP/inc/wlan_qct_wdi.h
++++ b/CORE/WDI/CP/inc/wlan_qct_wdi.h
+@@ -7128,6 +7128,8 @@ typedef void (*WDI_SetBatchScanCb)(void *pData, WDI_SetBatchScanRspType *pRsp);
+ 
+ #endif
+ 
++typedef void (*WDI_GetBcnMissRateCb)(wpt_uint8 status, wpt_uint32 bcnMissRate,
++                                     void* pUserData);
+ 
+ /*========================================================================
+  *     Function Declarations and Documentation
+@@ -10134,6 +10136,12 @@ WDI_TriggerBatchScanResultInd(WDI_TriggerBatchScanResultIndType *pWdiReq);
+ 
+ #endif /*FEATURE_WLAN_BATCH_SCAN*/
+ 
++
++WDI_Status WDI_GetBcnMissRate( void *pUserData,
++                                WDI_GetBcnMissRateCb wdiGetBcnMissRateCb,
++                                wpt_uint8   *bssid
++                             );
++
+ #ifdef __cplusplus
+  }
+ #endif 
+diff --git a/CORE/WDI/CP/inc/wlan_qct_wdi_i.h b/CORE/WDI/CP/inc/wlan_qct_wdi_i.h
+index ed6cb36..5d1053c 100644
+--- a/CORE/WDI/CP/inc/wlan_qct_wdi_i.h
++++ b/CORE/WDI/CP/inc/wlan_qct_wdi_i.h
+@@ -455,6 +455,8 @@ typedef enum
+   /* WLAN FW set batch scan request */
+   WDI_SET_BATCH_SCAN_REQ                        = 86,
+ 
++  WDI_GET_BCN_MISS_RATE_REQ                     = 87,
++
+   WDI_MAX_REQ,
+ 
+   /*Send a suspend Indication down to HAL*/
+@@ -747,6 +749,7 @@ typedef enum
+ 
+   WDI_SET_BATCH_SCAN_RESP                       = 85,
+ 
++  WDI_GET_BCN_MISS_RATE_RSP                     = 86,
+   /*-------------------------------------------------------------------------
+     Indications
+      !! Keep these last in the enum if possible
+@@ -5533,6 +5536,20 @@ WDI_Status WDI_ProcessSetBatchScanRsp
+   WDI_EventInfoType*     pEventData
+ );
+ 
++WDI_Status
++WDI_ProcessGetBcnMissRateReq
++(
++  WDI_ControlBlockType*  pWDICtx,
++  WDI_EventInfoType*     pEventData
++);
++
++WDI_Status
++WDI_ProcessGetBcnMissRateRsp
++(
++  WDI_ControlBlockType*  pWDICtx,
++  WDI_EventInfoType*     pEventData
++);
++
+ /**
+  @brief Process batch scan response from FW
+ 
+diff --git a/CORE/WDI/CP/src/wlan_qct_wdi.c b/CORE/WDI/CP/src/wlan_qct_wdi.c
+index c8e839e..1159c65 100644
+--- a/CORE/WDI/CP/src/wlan_qct_wdi.c
++++ b/CORE/WDI/CP/src/wlan_qct_wdi.c
+@@ -401,6 +401,7 @@ WDI_ReqProcFuncType  pfnReqProcTbl[WDI_MAX_UMAC_IND] =
+   NULL,
+ #endif /* FEATURE_WLAN_BATCH_SCAN */
+ 
++  WDI_ProcessGetBcnMissRateReq,          /* WDI_GET_BCN_MISS_RATE_REQ */
+   /*-------------------------------------------------------------------------
+     Indications
+   -------------------------------------------------------------------------*/
+@@ -612,6 +613,8 @@ WDI_RspProcFuncType  pfnRspProcTbl[WDI_MAX_RESP] =
+     NULL,
+ #endif /*FEATURE_WLAN_BATCH_SCAN*/
+ 
++  WDI_ProcessGetBcnMissRateRsp,        /*WDI_GET_BCN_MISS_RATE_RSP*/
++
+   /*---------------------------------------------------------------------
+     Indications
+   ---------------------------------------------------------------------*/
+@@ -985,6 +988,7 @@ static char *WDI_getReqMsgString(wpt_uint16 wdiReqMsgId)
+     CASE_RETURN_STRING( WDI_STOP_BATCH_SCAN_IND );
+     CASE_RETURN_STRING( WDI_TRIGGER_BATCH_SCAN_RESULT_IND);
+ #endif
++    CASE_RETURN_STRING( WDI_GET_BCN_MISS_RATE_REQ );
+     default:
+         return "Unknown WDI MessageId";
+   }
+@@ -1091,6 +1095,7 @@ static char *WDI_getRespMsgString(wpt_uint16 wdiRespMsgId)
+ #ifdef FEATURE_WLAN_BATCH_SCAN
+     CASE_RETURN_STRING( WDI_SET_BATCH_SCAN_RESP);
+ #endif
++    CASE_RETURN_STRING( WDI_GET_BCN_MISS_RATE_RSP );
+     default:
+         return "Unknown WDI MessageId";
+   }
+@@ -6198,7 +6203,6 @@ WDI_PostMainEvent
+   WDI_ControlBlockType*  pWDICtx,
+   WDI_MainEventType      wdiEV,
+   WDI_EventInfoType*     pEventData
+-
+ )
+ {
+   WDI_Status         wdiStatus;
+@@ -22692,7 +22696,8 @@ WDI_2_HAL_REQ_TYPE
+   case WDI_TRIGGER_BATCH_SCAN_RESULT_IND:
+        return WLAN_HAL_BATCHSCAN_TRIGGER_RESULT_IND;
+ #endif
+-
++  case WDI_GET_BCN_MISS_RATE_REQ:
++    return WLAN_HAL_GET_BCN_MISS_RATE_REQ;
+   default:
+     return WLAN_HAL_MSG_MAX;
+   }
+@@ -22953,6 +22958,8 @@ case WLAN_HAL_DEL_STA_SELF_RSP:
+     return WDI_HAL_CH_AVOID_IND;
+ #endif /* FEATURE_WLAN_CH_AVOID */
+ 
++  case WLAN_HAL_GET_BCN_MISS_RATE_RSP:
++    return WDI_GET_BCN_MISS_RATE_RSP;
+   default:
+     return eDRIVER_TYPE_MAX;
+   }
+@@ -28929,3 +28936,166 @@ WDI_ProcessChAvoidInd
+   return WDI_STATUS_SUCCESS;
+ }
+ #endif /* FEATURE_WLAN_CH_AVOID */
++
++/*
++ * FUNCTION: WDI_ProcessGetBcnMissRateRsp
++ * send the response to PE with beacon miss count
++ * received from WDI.
++ */
++WDI_Status
++WDI_ProcessGetBcnMissRateRsp
++(
++  WDI_ControlBlockType*  pWDICtx,
++  WDI_EventInfoType*     pEventData
++)
++{
++  WDI_GetBcnMissRateCb        wdiGetBcnMissRateCb;
++  tpHalBcnMissRateRspParams    pHalBcnMissRateRsp;
++
++  WPAL_TRACE( eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_INFO,
++                 "In %s",__func__);
++ /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
++
++  /*-------------------------------------------------------------------------
++    Sanity check
++  -------------------------------------------------------------------------*/
++  if (( NULL == pWDICtx ) || ( NULL == pEventData ) ||
++      ( NULL == pEventData->pEventData))
++  {
++     WPAL_TRACE( eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_WARN,
++                 "%s: Invalid parameters", __func__);
++     WDI_ASSERT(0);
++     return WDI_STATUS_E_FAILURE;
++  }
++
++  pHalBcnMissRateRsp = (tHalBcnMissRateRspParams *)pEventData->pEventData;
++  wdiGetBcnMissRateCb = (WDI_GetBcnMissRateCb)pWDICtx->pfncRspCB;
++
++  /*Notify UMAC*/
++  wdiGetBcnMissRateCb(pHalBcnMissRateRsp->status,
++                      pHalBcnMissRateRsp->bcnMissCnt, pWDICtx->pRspCBUserData);
++  return WDI_STATUS_SUCCESS;
++}
++
++/*
++ * FUNCTION: WDI_ProcessGetBcnMissRateReq
++ * Request to WDI to get missed beacon rate.
++ */
++WDI_Status
++WDI_ProcessGetBcnMissRateReq
++(
++  WDI_ControlBlockType*  pWDICtx,
++  WDI_EventInfoType*     pEventData
++)
++{
++  wpt_uint8*                   pSendBuffer         = NULL;
++  wpt_uint16                   usDataOffset        = 0;
++  wpt_uint16                   usSendSize          = 0;
++  wpt_uint8                    ucCurrentBSSSesIdx  = 0;
++  WDI_BSSSessionType*          pBSSSes             = NULL;
++  wpt_macAddr                  macBSSID;
++  WDI_GetBcnMissRateCb        *wdiGetBcnMissRateCb;
++  tHalBcnMissRateReqParams    halBcnMissRateReq;
++
++/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
++
++  /*-------------------------------------------------------------------------
++    Sanity check
++  -------------------------------------------------------------------------*/
++  if (( NULL == pEventData ) || ( NULL == pEventData->pEventData) ||
++      ( NULL == pEventData->pCBfnc ) )
++  {
++     WPAL_TRACE( eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_WARN,
++                 "%s: Invalid parameters", __func__);
++     WDI_ASSERT(0);
++     return WDI_STATUS_E_FAILURE;
++  }
++
++  wdiGetBcnMissRateCb   = (WDI_GetBcnMissRateCb *)pEventData->pCBfnc;
++
++  wpalMutexAcquire(&pWDICtx->wptMutex);
++
++  ucCurrentBSSSesIdx = WDI_FindAssocSession(pWDICtx,
++                                            pEventData->pEventData, &pBSSSes);
++  if ( NULL == pBSSSes )
++  {
++    WPAL_TRACE( eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_ERROR,
++        "%s: Association sequence for this BSS does not yet exist. macBSSID"
++         MAC_ADDRESS_STR, __func__, MAC_ADDR_ARRAY(macBSSID));
++    wpalMutexRelease(&pWDICtx->wptMutex);
++    return WDI_STATUS_E_NOT_ALLOWED;
++  }
++  wpalMutexRelease(&pWDICtx->wptMutex);
++
++  /*-----------------------------------------------------------------------
++    Get message buffer
++  -----------------------------------------------------------------------*/
++  if (( WDI_STATUS_SUCCESS != WDI_GetMessageBuffer(
++                                  pWDICtx, WDI_GET_BCN_MISS_RATE_REQ,
++                                  sizeof(tHalBcnMissRateReqParams),
++                                 &pSendBuffer, &usDataOffset, &usSendSize)) ||
++      ( usSendSize < (usDataOffset + sizeof(tHalBcnMissRateReqParams))))
++  {
++     WPAL_TRACE(eWLAN_MODULE_DAL_CTRL,  eWLAN_PAL_TRACE_LEVEL_WARN,
++                "Unable to get send buffer in get WDI_GET_BCN_MISS_RATE_REQ %p",
++                pEventData);
++     WDI_ASSERT(0);
++     return WDI_STATUS_E_FAILURE;
++  }
++
++  pWDICtx->wdiReqStatusCB = NULL;
++  pWDICtx->pReqStatusUserData = pEventData->pUserData;
++
++  halBcnMissRateReq.bssIdx = ucCurrentBSSSesIdx;
++
++  wpalMemoryCopy( pSendBuffer+usDataOffset,
++                  &halBcnMissRateReq,
++                  sizeof(tHalBcnMissRateReqParams));
++  /*-------------------------------------------------------------------------
++    Send Get STA Request to HAL
++  -------------------------------------------------------------------------*/
++  return  WDI_SendMsg( pWDICtx, pSendBuffer, usSendSize, wdiGetBcnMissRateCb,
++                       pEventData->pUserData, WDI_GET_BCN_MISS_RATE_RSP);
++}
++
++/**
++ @brief WDI_GetBcnMissRate
++
++ @param pUserData: user data will be passed back with the
++        callback
++        WDI_GetBcnMissRateCb: callback for passing back the response
++        of the get stats operation received from the device
++        bssid: bssid, to send bssIdx to FW
++
++ @return SUCCESS or FAIL
++*/
++WDI_Status WDI_GetBcnMissRate( void *pUserData,
++                                WDI_GetBcnMissRateCb wdiGetBcnMissRateCb,
++                                tANI_U8 *bssid )
++{
++    WDI_EventInfoType      wdiEventData;
++
++  /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
++
++  /*------------------------------------------------------------------------
++    Sanity Check
++  ------------------------------------------------------------------------*/
++  if ( eWLAN_PAL_FALSE == gWDIInitialized )
++  {
++    WPAL_TRACE(eWLAN_MODULE_DAL_CTRL, eWLAN_PAL_TRACE_LEVEL_ERROR,
++              "WDI API call before module is initialized - Fail request");
++
++    return WDI_STATUS_E_NOT_ALLOWED;
++  }
++
++  /*------------------------------------------------------------------------
++    Fill in Event data and post to the Main FSM
++  ------------------------------------------------------------------------*/
++  wdiEventData.wdiRequest      = WDI_GET_BCN_MISS_RATE_REQ;
++  wdiEventData.pEventData      = bssid;
++  wdiEventData.uEventDataSize  = sizeof(tSirMacAddr);
++  wdiEventData.pCBfnc          = wdiGetBcnMissRateCb;
++  wdiEventData.pUserData       = pUserData;
++
++  return WDI_PostMainEvent(&gWDICb, WDI_REQUEST_EVENT, &wdiEventData);
++}
+-- 
+1.7.8.3
+

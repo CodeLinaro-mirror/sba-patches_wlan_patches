@@ -1,0 +1,56 @@
+From 3470254713a9c708d9cb1f631dc906de1339b27b Mon Sep 17 00:00:00 2001
+From: Hanumantha Reddy Pothula <c_hpothu@codeaurora.org>
+Date: Thu, 1 May 2014 15:03:11 +0530
+Subject: [PATCH 1/2] wlan: updating interface file.
+
+Add new HAL indications to get continuous beacon miss rate from
+firmware.
+
+Change-Id: I2589b332486aab9b720fb01ecb5c5ca497926d5e
+CRs-Fixed: 656075.
+---
+ riva/inc/wlan_hal_msg.h |   22 ++++++++++++++++++++++
+ 1 files changed, 22 insertions(+), 0 deletions(-)
+
+diff --git a/riva/inc/wlan_hal_msg.h b/riva/inc/wlan_hal_msg.h
+index acd9c26..fc822b4 100644
+--- a/riva/inc/wlan_hal_msg.h
++++ b/riva/inc/wlan_hal_msg.h
+@@ -435,6 +435,10 @@ typedef enum
+    WLAN_HAL_IP_FORWARD_TABLE_UPDATE_IND     = 232,
+ 
+    WLAN_HAL_AVOID_FREQ_RANGE_IND            = 233,
++
++   WLAN_HAL_GET_BCN_MISS_RATE_REQ           = 260,
++   WLAN_HAL_GET_BCN_MISS_RATE_RSP           = 261,
++
+   WLAN_HAL_MSG_MAX = WLAN_HAL_MSG_TYPE_MAX_ENUM_SIZE
+ }tHalHostMsgType;
+ 
+@@ -6941,5 +6945,23 @@ typedef PACKED_PRE struct PACKED_POST
+ #else
+ #endif
+ 
++/*---------------------------------------------------------------------------
++ * WLAN_HAL_GET_BCN_MISS_RATE_REQ
++ *--------------------------------------------------------------------------*/
++typedef PACKED_PRE struct PACKED_POST
++{
++   /* Valid STA Idx for per STA stats request */
++   tANI_U8    bssIdx;
++}tHalBcnMissRateReqParams, *tpHalBcnMissRateReqParams;
++
++/*---------------------------------------------------------------------------
++ * WLAN_HAL_GET_BCN_MISS_RATE_RSP
++ *--------------------------------------------------------------------------*/
++typedef PACKED_PRE struct PACKED_POST
++{
++   tANI_U32           status;
++   tANI_U32           bcnMissCnt;
++}tHalBcnMissRateRspParams, *tpHalBcnMissRateRspParams;
++
+ #endif /* _WLAN_HAL_MSG_H_ */
+ 
+-- 
+1.7.8.3
+
