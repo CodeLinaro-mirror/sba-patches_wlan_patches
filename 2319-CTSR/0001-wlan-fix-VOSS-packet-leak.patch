@@ -1,0 +1,43 @@
+From 4960bdcd534f2a1c7913e25e30d4ef1eee0297a2 Mon Sep 17 00:00:00 2001
+From: Mihir Shete <smihir@qti.qualcomm.com>
+Date: Thu, 8 May 2014 13:02:05 +0530
+Subject: [PATCH] wlan: fix VOSS packet leak
+
+The VOSS API to return packets to the system
+had a bug which causes packet leak, the problem
+occurs when low resource condition is hit and
+the API is called to return a chain of VOSS packets
+to the system. When the condition is hit the VOSS
+packets are not added to the free or replenish
+list and they are lost forever from the system.
+
+Change-Id: I62d9238ba4ccb62365443650c8ad765c5042826f
+CRs-Fixed: 653612
+---
+ CORE/VOSS/src/vos_packet.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/CORE/VOSS/src/vos_packet.c b/CORE/VOSS/src/vos_packet.c
+index adabf04..e266abb 100644
+--- a/CORE/VOSS/src/vos_packet.c
++++ b/CORE/VOSS/src/vos_packet.c
+@@ -1301,7 +1301,7 @@ VOS_STATUS vos_pkt_return_packet( vos_pkt_t *pPacket )
+    vos_pkt_get_packet_callback callback;
+    v_SIZE_t *pCount;
+    VOS_PKT_TYPE packetType = VOS_PKT_TYPE_TX_802_3_DATA;
+-   v_BOOL_t lowResource = VOS_FALSE;
++   v_BOOL_t lowResource;
+    struct mutex * mlock;
+ 
+    // Validate the input parameter pointer
+@@ -1317,6 +1317,7 @@ VOS_STATUS vos_pkt_return_packet( vos_pkt_t *pPacket )
+       pNext = pPacket->pNext;
+       pPacket->pNext = NULL;
+ 
++      lowResource = VOS_FALSE;
+       // Validate that this really an initialized vos packet
+       if (unlikely(VPKT_MAGIC_NUMBER != pPacket->magic))
+       {
+-- 
+1.8.2.1
+
