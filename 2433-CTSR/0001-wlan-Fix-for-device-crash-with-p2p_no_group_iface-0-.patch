@@ -1,0 +1,31 @@
+From 705f281ca25f9f418c273818591697efe743d0f9 Mon Sep 17 00:00:00 2001
+From: Mahesh A Saptasagar <c_msapta@qti.qualcomm.com>
+Date: Fri, 25 Apr 2014 18:37:08 +0530
+Subject: [PATCH] wlan: Fix for device crash with p2p_no_group_iface=0 in
+ config file
+
+Since ula_complete variable is used in wait call without initializing
+the same leads to device crash, avoid the same by initializing the
+ula_completion completion variable in P2P GO/SAP context.
+
+Change-Id: Iac1b0fff881512b6a3bc6263d2e79b21f218aea2
+CRs-Fixed: 652376
+---
+ CORE/HDD/src/wlan_hdd_hostapd.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/CORE/HDD/src/wlan_hdd_hostapd.c b/CORE/HDD/src/wlan_hdd_hostapd.c
+index 78e172c..5329c3b 100644
+--- a/CORE/HDD/src/wlan_hdd_hostapd.c
++++ b/CORE/HDD/src/wlan_hdd_hostapd.c
+@@ -4164,6 +4164,7 @@ hdd_adapter_t* hdd_wlan_create_ap_dev( hdd_context_t *pHddCtx, tSirMacAddr macAd
+         init_completion(&pHostapdAdapter->tx_action_cnf_event);
+         init_completion(&pHostapdAdapter->cancel_rem_on_chan_var);
+         init_completion(&pHostapdAdapter->rem_on_chan_ready_event);
++        init_completion(&pHostapdAdapter->ula_complete);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,38))
+         init_completion(&pHostapdAdapter->offchannel_tx_event);
+ #endif
+-- 
+1.8.2.1
+
