@@ -1,0 +1,68 @@
+From b67623f6b4c68df4460291f3f29238fb90603f67 Mon Sep 17 00:00:00 2001
+From: Abhishek Singh <absingh@qti.qualcomm.com>
+Date: Mon, 5 May 2014 11:06:54 +0530
+Subject: [PATCH] SAP: Send Deauth frame if auth received in connected state.
+
+When DUT is operating in SAP mode and authentication frame
+from STA is received in connected state then send deauthentication
+frame to STA.
+CRs-Fixed: 657944
+
+Change-Id: Ife57df813bf2ae52a94fef40c63d5de5a5d794f4
+---
+ CORE/MAC/src/pe/lim/limProcessAuthFrame.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/CORE/MAC/src/pe/lim/limProcessAuthFrame.c b/CORE/MAC/src/pe/lim/limProcessAuthFrame.c
+index f5bee95..b05d292 100644
+--- a/CORE/MAC/src/pe/lim/limProcessAuthFrame.c
++++ b/CORE/MAC/src/pe/lim/limProcessAuthFrame.c
+@@ -594,8 +594,10 @@ limProcessAuthFrame(tpAniSirGlobal pMac, tANI_U8 *pRxPacketInfo, tpPESession pse
+                     &assocId, &psessionEntry->dph.dphHashTable);
+             if (pStaDs)
+             {
+-                tLimMlmDisassocReq       *pMlmDisassocReq = NULL;
++                tLimMlmDisassocReq      *pMlmDisassocReq = NULL;
+                 tLimMlmDeauthReq        *pMlmDeauthReq = NULL;
++                tAniBool                 isConnected = eSIR_TRUE;
++
+                 pMlmDisassocReq = pMac->lim.limDisassocDeauthCnfReq.pMlmDisassocReq;
+                 if (pMlmDisassocReq &&
+                         (vos_mem_compare((tANI_U8 *) pHdr->sa,
+@@ -607,6 +609,7 @@ limProcessAuthFrame(tpAniSirGlobal pMac, tANI_U8 *pRxPacketInfo, tpPESession pse
+                                 MAC_ADDRESS_STR),
+                                 MAC_ADDR_ARRAY(pMlmDisassocReq->peerMacAddr));)
+                     limProcessDisassocAckTimeout(pMac);
++                    isConnected = eSIR_FALSE;
+                 }
+                 pMlmDeauthReq = pMac->lim.limDisassocDeauthCnfReq.pMlmDeauthReq;
+                 if (pMlmDeauthReq &&
+@@ -619,6 +622,25 @@ limProcessAuthFrame(tpAniSirGlobal pMac, tANI_U8 *pRxPacketInfo, tpPESession pse
+                                 MAC_ADDRESS_STR),
+                                 MAC_ADDR_ARRAY(pMlmDeauthReq->peerMacAddr));)
+                     limProcessDeauthAckTimeout(pMac);
++                    isConnected = eSIR_FALSE;
++                }
++
++                /* pStaDS != NULL and isConnected = 1 means the STA is already
++                 * connected, But SAP received the Auth from that station.
++                 * So dont accept this auth frame and send Deauth frame.
++                 * STA will retry to connect back.
++                 */
++                if (isConnected)
++                {
++                    limLog(pMac, LOGE,
++                            FL("STA is already connected but received auth frame"
++                                "Send the Deauth and lim Delete Station Context"
++                                "(staId: %d, assocId: %d) "),
++                            pStaDs->staIndex, assocId);
++                    limSendDeauthMgmtFrame(pMac, eSIR_MAC_UNSPEC_FAILURE_REASON,
++                            (tANI_U8 *) pHdr->sa, psessionEntry, FALSE);
++                    limTriggerSTAdeletion(pMac, pStaDs, psessionEntry);
++                    return;
+                 }
+             }
+ 
+-- 
+1.8.2.1
+
