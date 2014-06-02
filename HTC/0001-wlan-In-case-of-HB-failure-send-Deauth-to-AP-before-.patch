@@ -1,0 +1,238 @@
+From 69d307b0209a1406e8614d1e5ae0f056df080d31 Mon Sep 17 00:00:00 2001
+From: Abhishek Singh <absingh@qti.qualcomm.com>
+Date: Tue, 20 May 2014 19:17:26 +0530
+Subject: [PATCH] wlan: In case of HB failure send Deauth to AP before
+ reconnection.
+
+If last disconnection is due to HB failure, send deauth to the
+AP/GO, before proceeding with the connection, to clear the
+previous connetion on Peer.
+
+Added an ini param gSendDeauthBeforeCon to enable this logic.
+
+Change-Id: Ifcd860906c8209cad556bf25417ce58e28b22ee5
+CRs-Fixed: 669350
+---
+ CORE/HDD/inc/wlan_hdd_cfg.h                    |  9 ++++++++
+ CORE/HDD/src/wlan_hdd_cfg.c                    |  8 +++++++
+ CORE/MAC/inc/aniGlobal.h                       |  2 ++
+ CORE/MAC/src/pe/lim/limApi.c                   |  6 ++++++
+ CORE/MAC/src/pe/lim/limLinkMonitoringAlgo.c    | 23 +++++++++++++++++++-
+ CORE/MAC/src/pe/lim/limProcessMlmRspMessages.c | 30 ++++++++++++++++++++++++++
+ CORE/SME/inc/csrApi.h                          |  1 +
+ CORE/SME/inc/csrInternal.h                     |  1 +
+ CORE/SME/src/csr/csrApiRoam.c                  |  2 ++
+ 9 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/CORE/HDD/inc/wlan_hdd_cfg.h b/CORE/HDD/inc/wlan_hdd_cfg.h
+index fef3d11..1a1f43f 100644
+--- a/CORE/HDD/inc/wlan_hdd_cfg.h
++++ b/CORE/HDD/inc/wlan_hdd_cfg.h
+@@ -1952,6 +1952,14 @@ typedef enum
+ #define CFG_BTC_SAP_ACTIVE_BT_LEN_MAX          ( 250000 )
+ #define CFG_BTC_SAP_ACTIVE_BT_LEN_DEFAULT      ( 90000 )
+ 
++/* If last disconnection was due to HB failure and we reconnect
++ * to same AP next time, send Deauth before starting connection
++ */
++#define CFG_ENABLE_DEAUTH_BEFORE_CONNECTION                  "gSendDeauthBeforeCon"
++#define CFG_ENABLE_DEAUTH_BEFORE_CONNECTION_MIN              (0)
++#define CFG_ENABLE_DEAUTH_BEFORE_CONNECTION_MAX              (1)
++#define CFG_ENABLE_DEAUTH_BEFORE_CONNECTION_DEFAULT          (0)
++
+ /*--------------------------------------------------------------------------- 
+   Type declarations
+   -------------------------------------------------------------------------*/ 
+@@ -2359,6 +2367,7 @@ typedef struct
+    v_U32_t                     cfgBtcActiveBtLen;
+    v_U32_t                     cfgBtcSapActiveWlanLen;
+    v_U32_t                     cfgBtcSapActiveBtLen;
++   v_BOOL_t                    sendDeauthBeforeCon;
+ } hdd_config_t;
+ /*--------------------------------------------------------------------------- 
+   Function declarations and documenation
+diff --git a/CORE/HDD/src/wlan_hdd_cfg.c b/CORE/HDD/src/wlan_hdd_cfg.c
+index 8edf14e..9d80f29 100644
+--- a/CORE/HDD/src/wlan_hdd_cfg.c
++++ b/CORE/HDD/src/wlan_hdd_cfg.c
+@@ -2783,6 +2783,13 @@ REG_VARIABLE( CFG_TDLS_PUAPSD_RX_FRAME_THRESHOLD, WLAN_PARAM_Integer,
+                 CFG_BTC_SAP_ACTIVE_BT_LEN_DEFAULT,
+                 CFG_BTC_SAP_ACTIVE_BT_LEN_MIN,
+                 CFG_BTC_SAP_ACTIVE_BT_LEN_MAX ),
++
++   REG_VARIABLE(CFG_ENABLE_DEAUTH_BEFORE_CONNECTION, WLAN_PARAM_Integer,
++                hdd_config_t, sendDeauthBeforeCon,
++                VAR_FLAGS_OPTIONAL | VAR_FLAGS_RANGE_CHECK_ASSUME_DEFAULT,
++                CFG_ENABLE_DEAUTH_BEFORE_CONNECTION_DEFAULT,
++                CFG_ENABLE_DEAUTH_BEFORE_CONNECTION_MIN,
++                CFG_ENABLE_DEAUTH_BEFORE_CONNECTION_MAX),
+ };
+ 
+ /*
+@@ -4603,6 +4610,7 @@ VOS_STATUS hdd_set_sme_config( hdd_context_t *pHddCtx )
+    /* Update the Directed scan offload setting */
+    smeConfig.fScanOffload =  pHddCtx->cfg_ini->fScanOffload;
+ 
++   smeConfig.csrConfig.sendDeauthBeforeCon = pConfig->sendDeauthBeforeCon;
+    halStatus = sme_UpdateConfig( pHddCtx->hHal, &smeConfig);
+    if ( !HAL_STATUS_SUCCESS( halStatus ) )
+    {
+diff --git a/CORE/MAC/inc/aniGlobal.h b/CORE/MAC/inc/aniGlobal.h
+index 26b154e..fe4f558 100644
+--- a/CORE/MAC/inc/aniGlobal.h
++++ b/CORE/MAC/inc/aniGlobal.h
+@@ -463,6 +463,8 @@ typedef struct sAniSirLim
+ 
+     // Heart-Beat interval value
+     tANI_U32   gLimHeartBeatCount;
++    tSirMacAddr gLimHeartBeatApMac[2];
++    tANI_U8 gLimHeartBeatApMacIndex;
+ 
+     // Statistics to keep track of no. beacons rcvd in heart beat interval
+     tANI_U16            gLimHeartBeatBeaconStats[MAX_NO_BEACONS_PER_HEART_BEAT_INTERVAL];
+diff --git a/CORE/MAC/src/pe/lim/limApi.c b/CORE/MAC/src/pe/lim/limApi.c
+index d89bf83..9640717 100644
+--- a/CORE/MAC/src/pe/lim/limApi.c
++++ b/CORE/MAC/src/pe/lim/limApi.c
+@@ -215,6 +215,12 @@ static void __limInitStatsVars(tpAniSirGlobal pMac)
+     // Heart-Beat interval value
+     pMac->lim.gLimHeartBeatCount = 0;
+ 
++    vos_mem_zero(pMac->lim.gLimHeartBeatApMac[0],
++            sizeof(tSirMacAddr));
++    vos_mem_zero(pMac->lim.gLimHeartBeatApMac[1],
++            sizeof(tSirMacAddr));
++    pMac->lim.gLimHeartBeatApMacIndex = 0;
++
+     // Statistics to keep track of no. beacons rcvd in heart beat interval
+     vos_mem_set(pMac->lim.gLimHeartBeatBeaconStats,
+                 sizeof(pMac->lim.gLimHeartBeatBeaconStats), 0);
+diff --git a/CORE/MAC/src/pe/lim/limLinkMonitoringAlgo.c b/CORE/MAC/src/pe/lim/limLinkMonitoringAlgo.c
+index 6a12302..f16037f 100644
+--- a/CORE/MAC/src/pe/lim/limLinkMonitoringAlgo.c
++++ b/CORE/MAC/src/pe/lim/limLinkMonitoringAlgo.c
+@@ -398,6 +398,27 @@ limTearDownLinkWithAp(tpAniSirGlobal pMac, tANI_U8 sessionId, tSirMacReasonCodes
+         vos_mem_copy((tANI_U8 *) &mlmDeauthInd.peerMacAddr,
+                       pStaDs->staAddr,
+                       sizeof(tSirMacAddr));
++        /* if sendDeauthBeforeCon is enabled and reasoncode is Beacon Missed
++         * Store the MAC of AP in the flip flop buffer. This MAC will be
++         * used to send Deauth before connection, if we connect to same AP
++         * after HB failure.
++         */
++        if(pMac->roam.configParam.sendDeauthBeforeCon &&
++            eSIR_BEACON_MISSED == reasonCode)
++        {
++           int apCount = pMac->lim.gLimHeartBeatApMacIndex;
++
++           if(pMac->lim.gLimHeartBeatApMacIndex)
++              pMac->lim.gLimHeartBeatApMacIndex = 0;
++           else
++              pMac->lim.gLimHeartBeatApMacIndex = 1;
++
++           limLog(pMac, LOGE, FL("HB Failure on MAC "
++                 MAC_ADDRESS_STR" Store it on Index %d"),
++                   MAC_ADDR_ARRAY(pStaDs->staAddr),apCount);
++
++           sirCopyMacAddr(pMac->lim.gLimHeartBeatApMac[apCount],pStaDs->staAddr);
++        }
+         mlmDeauthInd.reasonCode    = (tANI_U8) pStaDs->mlmStaContext.disassocReason;
+         mlmDeauthInd.deauthTrigger =  pStaDs->mlmStaContext.cleanupTrigger;
+ 
+@@ -518,7 +539,7 @@ void limHandleHeartBeatFailure(tpAniSirGlobal pMac,tpPESession psessionEntry)
+             }
+             /* Connected on DFS channel so should not send the probe request
+             * tear down the link directly */
+-            limTearDownLinkWithAp(pMac, psessionEntry->peSessionId, eSIR_MAC_UNSPEC_FAILURE_REASON);
++            limTearDownLinkWithAp(pMac, psessionEntry->peSessionId, eSIR_BEACON_MISSED);
+         }
+     }
+     else
+diff --git a/CORE/MAC/src/pe/lim/limProcessMlmRspMessages.c b/CORE/MAC/src/pe/lim/limProcessMlmRspMessages.c
+index 203d77b..7ff6b19 100644
+--- a/CORE/MAC/src/pe/lim/limProcessMlmRspMessages.c
++++ b/CORE/MAC/src/pe/lim/limProcessMlmRspMessages.c
+@@ -3633,6 +3633,36 @@ static void limProcessSwitchChannelJoinReq(tpAniSirGlobal pMac, tpPESession pses
+     pMac->lim.gLimTriggerBackgroundScanDuringQuietBss = (val) ? 1 : 0;
+     // Apply previously set configuration at HW
+     limApplyConfiguration(pMac, psessionEntry);
++
++    /* If sendDeauthBeforeCon is enabled, Send Deauth first to AP if last
++     * disconnection was caused by HB failure.
++     */
++    if(pMac->roam.configParam.sendDeauthBeforeCon)
++    {
++       int apCount;
++
++       for(apCount = 0; apCount < 2; apCount++)
++       {
++
++           if (vos_mem_compare(psessionEntry->pLimMlmJoinReq->bssDescription.bssId,
++                    pMac->lim.gLimHeartBeatApMac[apCount], sizeof(tSirMacAddr)))
++           {
++               limLog(pMac, LOGE, FL("Index %d Sessionid: %d Send deauth on "
++                 "channel %d to BSSID: "MAC_ADDRESS_STR ), apCount,
++                 psessionEntry->peSessionId, psessionEntry->currentOperChannel,
++                 MAC_ADDR_ARRAY(psessionEntry->pLimMlmJoinReq->bssDescription.bssId));
++
++               limSendDeauthMgmtFrame( pMac, eSIR_MAC_UNSPEC_FAILURE_REASON,
++                     psessionEntry->pLimMlmJoinReq->bssDescription.bssId,
++                     psessionEntry, FALSE );
++
++               vos_mem_zero(pMac->lim.gLimHeartBeatApMac[apCount],
++                       sizeof(tSirMacAddr));
++               break;
++           }
++       }
++    }
++
+     /// Wait for Beacon to announce join success
+     vos_mem_copy(ssId.ssId,
+                  psessionEntry->ssId.ssId,
+diff --git a/CORE/SME/inc/csrApi.h b/CORE/SME/inc/csrApi.h
+index 9324c9a..f69126a 100644
+--- a/CORE/SME/inc/csrApi.h
++++ b/CORE/SME/inc/csrApi.h
+@@ -1126,6 +1126,7 @@ typedef struct tagCsrConfigParam
+ 
+     tANI_U8 isAmsduSupportInAMPDU;
+ 
++    tANI_BOOLEAN sendDeauthBeforeCon;
+ }tCsrConfigParam;
+ 
+ //Tush
+diff --git a/CORE/SME/inc/csrInternal.h b/CORE/SME/inc/csrInternal.h
+index d209ecd..dbeb63a 100644
+--- a/CORE/SME/inc/csrInternal.h
++++ b/CORE/SME/inc/csrInternal.h
+@@ -663,6 +663,7 @@ typedef struct tagCsrConfig
+      */
+     tANI_BOOLEAN enableHeartBeatOffload;
+     tANI_U8 isAmsduSupportInAMPDU;
++    tANI_BOOLEAN sendDeauthBeforeCon;
+ }tCsrConfig;
+ 
+ typedef struct tagCsrChannelPowerInfo
+diff --git a/CORE/SME/src/csr/csrApiRoam.c b/CORE/SME/src/csr/csrApiRoam.c
+index 08a7feb..5de1f02 100644
+--- a/CORE/SME/src/csr/csrApiRoam.c
++++ b/CORE/SME/src/csr/csrApiRoam.c
+@@ -1740,6 +1740,7 @@ eHalStatus csrChangeDefaultConfigParam(tpAniSirGlobal pMac, tCsrConfigParam *pPa
+         pMac->roam.configParam.enableOxygenNwk = pParam->enableOxygenNwk;
+ 
+         pMac->roam.configParam.isAmsduSupportInAMPDU = pParam->isAmsduSupportInAMPDU;
++        pMac->roam.configParam.sendDeauthBeforeCon = pParam->sendDeauthBeforeCon;
+     }
+     
+     return status;
+@@ -1866,6 +1867,7 @@ eHalStatus csrGetConfigParam(tpAniSirGlobal pMac, tCsrConfigParam *pParam)
+ 
+         pParam->isAmsduSupportInAMPDU = pMac->roam.configParam.isAmsduSupportInAMPDU;
+ 
++        pParam->sendDeauthBeforeCon = pMac->roam.configParam.sendDeauthBeforeCon;
+         csrSetChannels(pMac, pParam);
+ 
+         status = eHAL_STATUS_SUCCESS;
+-- 
+1.8.2.1
+
