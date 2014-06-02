@@ -1,0 +1,38 @@
+From 4bf1eb42a071b5b6e7624f7a1a275571f3a95354 Mon Sep 17 00:00:00 2001
+From: Abhishek Singh <absingh@qti.qualcomm.com>
+Date: Thu, 22 May 2014 14:07:31 +0530
+Subject: [PATCH 2/2] wlan: Remove the NULL SSID check from AP caps mismatch
+ logic.
+
+In limDetectChangeInApCapabilities if SSID is NULL DUT sends an
+unicast probe request to AP and recheck the capability once
+it gets the probe resp.Some APs sends NULL SSID even in Probe
+resp and thus AP is disconnected.
+
+Removed the NULL SSID check from limDetectChangeInApCapabilities.
+
+Change-Id: Ie195b8ab9a0e24e5c6082d62090cfa7c22ee3ccc
+CRs-Fixed: 669282
+---
+ CORE/MAC/src/pe/lim/limApi.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/CORE/MAC/src/pe/lim/limApi.c b/CORE/MAC/src/pe/lim/limApi.c
+index 9b7d830..682d802 100644
+--- a/CORE/MAC/src/pe/lim/limApi.c
++++ b/CORE/MAC/src/pe/lim/limApi.c
+@@ -1734,9 +1734,8 @@ limDetectChangeInApCapabilities(tpAniSirGlobal pMac,
+     newChannel = (tANI_U8) pBeacon->channelNumber;
+ 
+     if ( ( false == psessionEntry->limSentCapsChangeNtf ) &&
+-        ( ( ( limIsNullSsid(&pBeacon->ssId) ) ||
+-          ( ( !limIsNullSsid(&pBeacon->ssId) ) &&
+-             ( false == limCmpSSid(pMac, &pBeacon->ssId, psessionEntry) ) ) ) ||
++        ( ( ( !limIsNullSsid(&pBeacon->ssId) ) &&
++             ( false == limCmpSSid(pMac, &pBeacon->ssId, psessionEntry) ) ) ||
+           ( (SIR_MAC_GET_ESS(apNewCaps.capabilityInfo) !=
+              SIR_MAC_GET_ESS(psessionEntry->limCurrentBssCaps) ) ||
+           ( SIR_MAC_GET_PRIVACY(apNewCaps.capabilityInfo) !=
+-- 
+1.8.2.1
+
