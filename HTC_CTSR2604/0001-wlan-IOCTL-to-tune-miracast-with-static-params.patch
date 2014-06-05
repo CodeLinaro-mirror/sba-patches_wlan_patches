@@ -1,0 +1,206 @@
+From 052fa038f600f4b54d4799a5dcc42f0b708265d9 Mon Sep 17 00:00:00 2001
+From: Abhishek Singh <absingh@codeaurora.org>
+Date: Tue, 3 Jun 2014 18:58:03 +0530
+Subject: [PATCH] wlan: IOCTL to tune miracast with static params.
+
+Implement IOCTL which set the static config as below:
+1.Disable 64QAM rate.
+2.Use 4 blocks only for aggregation.
+3.Disable probe response for broadcast probe in GO.
+
+Change-Id: I0675a41d690fe5f0e8fda189bd92cf29c07b375d
+CRs-Fixed: 671646
+---
+ CORE/HDD/src/wlan_hdd_wext.c                  | 17 +++++++++++++++++
+ CORE/MAC/inc/aniGlobal.h                      |  1 +
+ CORE/MAC/src/pe/lim/limProcessProbeReqFrame.c |  5 +++++
+ CORE/MAC/src/pe/lim/limUtils.c                | 15 ++++++++++++---
+ CORE/SME/inc/sme_Api.h                        |  2 ++
+ CORE/SME/src/sme_common/sme_Api.c             | 23 +++++++++++++++++++++++
+ CORE/WDA/src/wlan_qct_wda.c                   |  9 ++++++---
+ 7 files changed, 66 insertions(+), 6 deletions(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_wext.c b/CORE/HDD/src/wlan_hdd_wext.c
+index b034f84..9295385 100644
+--- a/CORE/HDD/src/wlan_hdd_wext.c
++++ b/CORE/HDD/src/wlan_hdd_wext.c
+@@ -161,6 +161,8 @@ static const hdd_freq_chan_map_t freq_chan_map[] = { {2412, 1}, {2417, 2},
+ #define WE_SET_MAX_TX_POWER_5_0   12
+ /* Private IOCTL for debug connection issues */
+ #define WE_SET_DEBUG_LOG     13
++#define WE_SET_MIRACAST_TUNE     14
++
+ 
+ 
+ /* Private ioctls and their sub-ioctls */
+@@ -4379,7 +4381,19 @@ static int iw_setint_getnone(struct net_device *dev, struct iw_request_info *inf
+            sme_UpdateConnectDebug(pHddCtx->hHal, set_value);
+            break;
+         }
++        case WE_SET_MIRACAST_TUNE:
++        {
++           hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
++           v_U32_t numBuffAdvert;
++
++           numBuffAdvert = set_value ? 4 : pHddCtx->cfg_ini->numBuffAdvert;
+ 
++           hddLog(VOS_TRACE_LEVEL_INFO,"%s: Set Miracast tuning %d "
++                                       "numBuffAdvert = %d", __func__,
++                                        set_value, numBuffAdvert);
++           sme_TuneMiracast(pHddCtx->hHal, numBuffAdvert, set_value);
++           break;
++        }
+         default:
+         {
+             hddLog(LOGE, "Invalid IOCTL setvalue command %d value %d \n",
+@@ -7708,6 +7722,9 @@ static const struct iw_priv_args we_private_args[] = {
+         IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,
+         0, "setDbgLvl" },
+ 
++    {   WE_SET_MIRACAST_TUNE,
++        IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,
++        0, "setMiracast" },
+     /* handlers for main ioctl */
+     {   WLAN_PRIV_SET_NONE_GET_INT,
+         0,
+diff --git a/CORE/MAC/inc/aniGlobal.h b/CORE/MAC/inc/aniGlobal.h
+index 10f6299..7b0c98e 100644
+--- a/CORE/MAC/inc/aniGlobal.h
++++ b/CORE/MAC/inc/aniGlobal.h
+@@ -1073,6 +1073,7 @@ typedef struct sAniSirGlobal
+ #endif
+     tANI_U8 fScanOffload;
+     tANI_U32 fEnableDebugLog;
++    tANI_BOOLEAN tuneMiracast;
+ } tAniSirGlobal;
+ 
+ #ifdef FEATURE_WLAN_TDLS
+diff --git a/CORE/MAC/src/pe/lim/limProcessProbeReqFrame.c b/CORE/MAC/src/pe/lim/limProcessProbeReqFrame.c
+index 5ca05c9..4fc246a 100644
+--- a/CORE/MAC/src/pe/lim/limProcessProbeReqFrame.c
++++ b/CORE/MAC/src/pe/lim/limProcessProbeReqFrame.c
+@@ -618,6 +618,11 @@ limProcessProbeReqFrame(tpAniSirGlobal pMac, tANI_U8 *pRxPacketInfo,tpPESession
+             else
+             {
+                 {
++                    if ((VOS_P2P_GO_MODE == psessionEntry->pePersona) && pMac->tuneMiracast)
++                    {
++                        limLog(pMac, LOGW, FL("Droping broadcaset probe req for miracast tuning"));
++                        return;
++                    }
+                     // Broadcast SSID in the Probe Request.
+                     // Reply with SSID we're configured with.
+                     //Turn off the SSID length to 0 if hidden SSID feature is present
+diff --git a/CORE/MAC/src/pe/lim/limUtils.c b/CORE/MAC/src/pe/lim/limUtils.c
+index 366817a..79a3bf9 100644
+--- a/CORE/MAC/src/pe/lim/limUtils.c
++++ b/CORE/MAC/src/pe/lim/limUtils.c
+@@ -5908,14 +5908,23 @@ tSirRetStatus limPostMlmAddBAReq( tpAniSirGlobal pMac,
+           FL( "Requesting ADDBA with Cisco 1225 AP, window size 25"));
+       pMlmAddBAReq->baBufferSize = MAX_BA_WINDOW_SIZE_FOR_CISCO;
+   }
+-  else
++  else if(pMac->tuneMiracast)
++  {
++      if (wlan_cfgGetInt(pMac, WNI_CFG_NUM_BUFF_ADVERT , &val) != eSIR_SUCCESS)
++      {
++           limLog(pMac, LOGE, FL("Unable to get WNI_CFG_NUM_BUFF_ADVERT"));
++           status = eSIR_FAILURE;
++           goto returnFailure;
++      }
++      pMlmAddBAReq->baBufferSize = val;
++  }else
+       pMlmAddBAReq->baBufferSize = 0;
+ 
+   limLog( pMac, LOGW,
+-      FL( "Requesting an ADDBA to setup a %s BA session with STA %d for TID %d" ),
++      FL( "Requesting an ADDBA to setup a %s BA session with STA %d for TID %d buffsize = %d" ),
+       (pMlmAddBAReq->baPolicy ? "Immediate": "Delayed"),
+       pStaDs->staIndex,
+-      tid );
++      tid, pMlmAddBAReq->baBufferSize );
+ 
+   // BA Timeout
+   if (wlan_cfgGetInt(pMac, WNI_CFG_BA_TIMEOUT, &val) != eSIR_SUCCESS)
+diff --git a/CORE/SME/inc/sme_Api.h b/CORE/SME/inc/sme_Api.h
+index 0ee0307..7642d59 100644
+--- a/CORE/SME/inc/sme_Api.h
++++ b/CORE/SME/inc/sme_Api.h
+@@ -3212,5 +3212,7 @@ eHalStatus sme_AddChAvoidCallback
+ eHalStatus sme_UpdateConnectDebug(tHalHandle hHal, tANI_U32 set_value);
+ 
+ eHalStatus sme_getBcnMissRate(tHalHandle, tANI_U8, void *, void *);
++void sme_TuneMiracast(tHalHandle hHal,tANI_U32 iniNumBuffAdvert , tANI_U32 set_value);
++
+ 
+ #endif //#if !defined( __SME_API_H )
+diff --git a/CORE/SME/src/sme_common/sme_Api.c b/CORE/SME/src/sme_common/sme_Api.c
+index 8b9102d..bb322b3 100644
+--- a/CORE/SME/src/sme_common/sme_Api.c
++++ b/CORE/SME/src/sme_common/sme_Api.c
+@@ -10355,4 +10355,27 @@ eHalStatus sme_UpdateConnectDebug(tHalHandle hHal, tANI_U32 set_value)
+     pMac->fEnableDebugLog = set_value;
+     return (status);
+ }
++void sme_TuneMiracast(tHalHandle hHal, tANI_U32 iniNumBuffAdvert , tANI_U32 set_value)
++{
++    tpAniSirGlobal pMac = PMAC_STRUCT(hHal);
++    tANI_U8 mcsSet[SIZE_OF_SUPPORTED_MCS_SET];
++    tANI_U32 val = SIZE_OF_SUPPORTED_MCS_SET;
++
++    vos_mem_zero(mcsSet, SIZE_OF_SUPPORTED_MCS_SET);
++    ccmCfgGetStr(hHal, WNI_CFG_SUPPORTED_MCS_SET, mcsSet,&val);
++
++    if(set_value)
++    {
++       pMac->tuneMiracast=1;
++       /*disable MCS 5,6,7 i.e. 64QAM rates*/
++       mcsSet[0]=0x1F;
++    }
++    else
++    {
++       pMac->tuneMiracast=0;
++       mcsSet[0]=0xFF;
++    }
++    ccmCfgSetInt(hHal, WNI_CFG_NUM_BUFF_ADVERT, iniNumBuffAdvert, NULL, eANI_BOOLEAN_FALSE);
++    ccmCfgSetStr(hHal, WNI_CFG_SUPPORTED_MCS_SET, mcsSet, val, NULL, eANI_BOOLEAN_FALSE);
++}
+ 
+diff --git a/CORE/WDA/src/wlan_qct_wda.c b/CORE/WDA/src/wlan_qct_wda.c
+index a685c2a..10054fd 100644
+--- a/CORE/WDA/src/wlan_qct_wda.c
++++ b/CORE/WDA/src/wlan_qct_wda.c
+@@ -5478,7 +5478,7 @@ void WDA_AddBAReqCallback(WDI_AddBARspinfoType *pAddBARspParams,
+  * Request to WDI to Update the ADDBA REQ params.
+  */ 
+ VOS_STATUS WDA_ProcessAddBAReq(tWDA_CbContext *pWDA, VOS_STATUS status,
+-           tANI_U16 baSessionID, tANI_U8 staIdx, tAddBAParams *pAddBAReqParams)
++           tANI_U16 baSessionID, tANI_U8 staIdx, tANI_U8 ucWinSize, tAddBAParams *pAddBAReqParams)
+ {
+    WDI_Status wstatus;
+    WDI_AddBAReqParamsType *wdiAddBAReqParam = 
+@@ -5508,8 +5508,11 @@ VOS_STATUS WDA_ProcessAddBAReq(tWDA_CbContext *pWDA, VOS_STATUS status,
+       WDI_AddBAReqinfoType *wdiAddBaInfo = &wdiAddBAReqParam->wdiBAInfoType ;
+       wdiAddBaInfo->ucSTAIdx = staIdx ;
+       wdiAddBaInfo->ucBaSessionID = baSessionID ;
+-      wdiAddBaInfo->ucWinSize     = WDA_BA_MAX_WINSIZE ;
++      wdiAddBaInfo->ucWinSize = ucWinSize ;
+    } while(0) ;
++   VOS_TRACE( VOS_MODULE_ID_WDA, VOS_TRACE_LEVEL_INFO,
++                          "%s: wdiAddBaInfo->ucWinSize = %d",
++                          __func__, wdiAddBAReqParam->wdiBAInfoType.ucWinSize);
+    wdiAddBAReqParam->wdiReqStatusCB = NULL ;
+    pWdaParams->pWdaContext = pWDA;
+    /* store Params pass it to WDI */
+@@ -5581,7 +5584,7 @@ void WDA_AddBASessionReqCallback(
+                                         wdiAddBaSession->ucWinSize,
+                                         wdiAddBaSession->usBaSSN );
+       WDA_ProcessAddBAReq(pWDA, status, wdiAddBaSession->usBaSessionID, 
+-                                      wdiAddBaSession->ucSTAIdx, pAddBAReqParams) ;
++                          wdiAddBaSession->ucSTAIdx, wdiAddBaSession->ucWinSize, pAddBAReqParams) ;
+    }
+    else
+    {
+-- 
+1.8.2.1
+
