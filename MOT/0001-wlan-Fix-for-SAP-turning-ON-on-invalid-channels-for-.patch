@@ -1,0 +1,339 @@
+From 7fa10c2ac55f872826ed1f5d2cf3f3ad0ded93da Mon Sep 17 00:00:00 2001
+From: Mahesh A Saptasagar <msapta@codeaurora.org>
+Date: Wed, 14 May 2014 12:43:37 +0530
+Subject: [PATCH] wlan: Fix for SAP turning ON on invalid channels for a given
+ CC
+
+Avoid SAP turning ON on invalid channels when a particular country
+code is set in hostapd.conf due to race condition between reg
+notifier and nv bin based channel initializtion during driver load.
+
+This commit ensures reg_notifier callback is called once the
+channels are initialized based on nv bin, thus updating the latest
+reg domain set by the notifier callback.
+
+Change-Id: I4e8e9e9a86a58c8bf4c4ee9ebb85ba691694bd1c
+CRs-Fixed: 661014
+---
+ CORE/HDD/src/wlan_hdd_main.c      | 82 ++++++++++++++++++++++++---------------
+ CORE/SME/inc/csrInternal.h        |  7 ++++
+ CORE/SME/inc/sme_Api.h            | 15 +++++++
+ CORE/SME/src/csr/csrApiRoam.c     | 26 ++++++++++---
+ CORE/SME/src/sme_common/sme_Api.c | 28 +++++++++++++
+ 5 files changed, 120 insertions(+), 38 deletions(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index c8f31f1..77e9382 100644
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -186,6 +186,8 @@ static VOS_STATUS hdd_parse_ccx_beacon_req(tANI_U8 *pValue,
+                                      tCsrCcxBeaconReq *pCcxBcnReq);
+ #endif /* FEATURE_WLAN_CCX && FEATURE_WLAN_CCX_UPLOAD */
+ 
++static VOS_STATUS wlan_hdd_init_channels_for_cc(hdd_context_t *pHddCtx);
++
+ /*
+  * Driver miracast parameters 0-Disabled
+  * 1-Source, 2-Sink
+@@ -7996,28 +7998,11 @@ int hdd_wlan_startup(struct device *dev )
+       goto err_vosclose;
+    }
+ 
+-#ifdef CONFIG_ENABLE_LINUX_REG
+-   /* registration of wiphy dev with cfg80211 */
+-   if (0 > wlan_hdd_cfg80211_register(wiphy))
+-   {
+-       hddLog(VOS_TRACE_LEVEL_ERROR,"%s: wiphy register failed", __func__);
+-       goto err_vosclose;
+-   }
+-
+-    status = wlan_hdd_init_channels(pHddCtx);
+-   if ( !VOS_IS_STATUS_SUCCESS( status ) )
+-   {
+-      hddLog(VOS_TRACE_LEVEL_FATAL, "%s: wlan_hdd_init_channels failed",
+-             __func__);
+-      goto err_wiphy_unregister;
+-   }
+-#endif
+-
+    status = vos_preStart( pHddCtx->pvosContext );
+    if ( !VOS_IS_STATUS_SUCCESS( status ) )
+    {
+       hddLog(VOS_TRACE_LEVEL_FATAL, "%s: vos_preStart failed", __func__);
+-      goto err_wiphy_unregister;
++      goto err_vosclose;
+    }
+ 
+    /* Note that the vos_preStart() sequence triggers the cfg download.
+@@ -8028,7 +8013,7 @@ int hdd_wlan_startup(struct device *dev )
+    if ( VOS_STATUS_SUCCESS != status )
+    {
+       hddLog(VOS_TRACE_LEVEL_FATAL, "%s: Failed hdd_set_sme_config", __func__);
+-      goto err_wiphy_unregister;
++      goto err_vosclose;
+    }
+ 
+    //Initialize the WMM module
+@@ -8036,7 +8021,7 @@ int hdd_wlan_startup(struct device *dev )
+    if (!VOS_IS_STATUS_SUCCESS(status))
+    {
+       hddLog(VOS_TRACE_LEVEL_FATAL, "%s: hdd_wmm_init failed", __func__);
+-      goto err_wiphy_unregister;
++      goto err_vosclose;
+    }
+ 
+    /* In the integrated architecture we update the configuration from
+@@ -8047,7 +8032,7 @@ int hdd_wlan_startup(struct device *dev )
+    if (FALSE == hdd_update_config_dat(pHddCtx))
+    {
+       hddLog(VOS_TRACE_LEVEL_FATAL,"%s: config update failed",__func__ );
+-      goto err_wiphy_unregister;
++      goto err_vosclose;
+    }
+ 
+    // Get mac addr from platform driver
+@@ -8129,7 +8114,7 @@ int hdd_wlan_startup(struct device *dev )
+       {
+          hddLog(VOS_TRACE_LEVEL_ERROR,"%s: Failed to set MAC Address. "
+                 "HALStatus is %08d [x%08x]",__func__, halStatus, halStatus );
+-         goto err_wiphy_unregister;
++         goto err_vosclose;
+       }
+    }
+ 
+@@ -8139,7 +8124,7 @@ int hdd_wlan_startup(struct device *dev )
+    if ( !VOS_IS_STATUS_SUCCESS( status ) )
+    {
+       hddLog(VOS_TRACE_LEVEL_FATAL,"%s: vos_start failed",__func__);
+-      goto err_wiphy_unregister;
++      goto err_vosclose;
+    }
+ 
+ #ifdef FEATURE_WLAN_CH_AVOID
+@@ -8172,6 +8157,31 @@ int hdd_wlan_startup(struct device *dev )
+    }
+ #endif
+ 
++#ifdef CONFIG_ENABLE_LINUX_REG
++   status = wlan_hdd_init_channels(pHddCtx);
++   if ( !VOS_IS_STATUS_SUCCESS( status ) )
++   {
++      hddLog(VOS_TRACE_LEVEL_FATAL, "%s: wlan_hdd_init_channels failed",
++             __func__);
++      goto err_vosstop;
++   }
++
++   /* registration of wiphy dev with cfg80211 */
++   if (0 > wlan_hdd_cfg80211_register(wiphy))
++   {
++       hddLog(VOS_TRACE_LEVEL_ERROR,"%s: wiphy register failed", __func__);
++       goto err_vosstop;
++   }
++
++   status = wlan_hdd_init_channels_for_cc(pHddCtx);
++   if ( !VOS_IS_STATUS_SUCCESS( status ) )
++   {
++      hddLog(VOS_TRACE_LEVEL_FATAL, "%s: wlan_hdd_init_channels_for_cc failed",
++             __func__);
++      goto err_unregister_wiphy;
++   }
++#endif
++
+    if (VOS_STA_SAP_MODE == hdd_get_conparam())
+    {
+      pAdapter = hdd_open_adapter( pHddCtx, WLAN_HDD_SOFTAP, "softap.%d", 
+@@ -8423,19 +8433,11 @@ err_bap_close:
+ 
+ err_close_adapter:
+    hdd_close_all_adapters( pHddCtx );
+-
+-#ifndef CONFIG_ENABLE_LINUX_REG
++err_unregister_wiphy:
+    wiphy_unregister(wiphy) ;
+-#endif
+-
+ err_vosstop:
+    vos_stop(pVosContext);
+ 
+-err_wiphy_unregister:
+-#ifdef CONFIG_ENABLE_LINUX_REG
+-   wiphy_unregister(wiphy);
+-#endif
+-
+ err_vosclose:
+    status = vos_sched_close( pVosContext );
+    if (!VOS_IS_STATUS_SUCCESS(status))    {
+@@ -9303,6 +9305,22 @@ static VOS_STATUS wlan_hdd_init_channels(hdd_context_t *pHddCtx)
+    }
+ }
+ 
++static VOS_STATUS wlan_hdd_init_channels_for_cc(hdd_context_t *pHddCtx)
++{
++   eHalStatus status;
++
++   status = sme_InitChannelsForCC(pHddCtx->hHal);
++   if (HAL_STATUS_SUCCESS(status))
++   {
++      return VOS_STATUS_SUCCESS;
++   }
++   else
++   {
++      hddLog(VOS_TRACE_LEVEL_FATAL,"%s: Issue reg hint failed(%d)",
++             __func__, status);
++      return VOS_STATUS_E_FAULT;
++   }
++}
+ /*
+  * API to find if there is any STA or P2P-Client is connected
+  */
+diff --git a/CORE/SME/inc/csrInternal.h b/CORE/SME/inc/csrInternal.h
+index e38f3a7..2caf669 100644
+--- a/CORE/SME/inc/csrInternal.h
++++ b/CORE/SME/inc/csrInternal.h
+@@ -1315,6 +1315,13 @@ eHalStatus csrOpen(tpAniSirGlobal pMac);
+ eHalStatus csrInitChannels(tpAniSirGlobal pMac);
+ 
+ /* ---------------------------------------------------------------------------
++    \fn csrInitChannelsForCC
++    \brief This function must be called to issue reg hint
++    \return eHalStatus
++  -------------------------------------------------------------------------------*/
++eHalStatus csrInitChannelsForCC(tpAniSirGlobal pMac);
++
++/* ---------------------------------------------------------------------------
+     \fn csrClose
+     \brief To close down CSR module. There should not be any API call into CSR after calling this function.
+     \return eHalStatus
+diff --git a/CORE/SME/inc/sme_Api.h b/CORE/SME/inc/sme_Api.h
+index ae53a8f..7394a48 100644
+--- a/CORE/SME/inc/sme_Api.h
++++ b/CORE/SME/inc/sme_Api.h
+@@ -1406,6 +1406,21 @@ eHalStatus sme_SetCountryCode(tHalHandle hHal, tANI_U8 *pCountry, tANI_BOOLEAN *
+  -------------------------------------------------------------------------------*/
+ eHalStatus sme_InitChannels(tHalHandle hHal);
+ 
++
++/* ---------------------------------------------------------------------------
++    \fn sme_InitChannelsForCC
++
++    \brief Used to issue regulatory hint to user
++
++    \param hHal - global pMac structure
++
++    \return eHalStatus  SUCCESS.
++
++                        FAILURE or RESOURCES  The API finished and failed.
++
++ -------------------------------------------------------------------------------*/
++eHalStatus sme_InitChannelsForCC(tHalHandle hHal);
++
+ /* ---------------------------------------------------------------------------
+     \fn sme_ResetCountryCodeInformation
+     \brief this function is to reset the country code current being used back to EEPROM default
+diff --git a/CORE/SME/src/csr/csrApiRoam.c b/CORE/SME/src/csr/csrApiRoam.c
+index 15a620f..ece18ba 100644
+--- a/CORE/SME/src/csr/csrApiRoam.c
++++ b/CORE/SME/src/csr/csrApiRoam.c
+@@ -365,7 +365,7 @@ eHalStatus csrOpen(tpAniSirGlobal pMac)
+         status = csrInitGetChannels( pMac );
+ #endif
+     }while(0);
+-    
++
+     return (status);
+ }
+ 
+@@ -379,7 +379,7 @@ eHalStatus csrInitChannels(tpAniSirGlobal pMac)
+     eHalStatus status = eHAL_STATUS_SUCCESS;
+     static uNvTables nvTables;
+     VOS_STATUS vosStatus = VOS_STATUS_SUCCESS;
+-    v_REGDOMAIN_t regId;
++    v_REGDOMAIN_t regId = REGDOMAIN_WORLD;
+ 
+     vosStatus = vos_nv_readDefaultCountryTable( &nvTables );
+     if ( VOS_IS_STATUS_SUCCESS(vosStatus) )
+@@ -398,24 +398,38 @@ eHalStatus csrInitChannels(tpAniSirGlobal pMac)
+     }
+     smsLog( pMac, LOG1, FL(" country Code from nvRam %.2s"), pMac->scan.countryCodeDefault );
+ 
++    WDA_SetRegDomain(pMac, regId, eSIR_TRUE);
++    pMac->scan.domainIdDefault = regId;
++    pMac->scan.domainIdCurrent = pMac->scan.domainIdDefault;
++    vos_mem_copy(pMac->scan.countryCodeCurrent, pMac->scan.countryCodeDefault,
++                 WNI_CFG_COUNTRY_CODE_LEN);
++    status = csrInitGetChannels( pMac );
++
++    return status;
++}
++
++eHalStatus csrInitChannelsForCC(tpAniSirGlobal pMac)
++{
++    eHalStatus status = eHAL_STATUS_SUCCESS;
++    v_REGDOMAIN_t regId = REGDOMAIN_WORLD;
++
+     if (!('0' == pMac->scan.countryCodeDefault[0] &&
+         '0' == pMac->scan.countryCodeDefault[1]))
+     {
+         csrGetRegulatoryDomainForCountry(pMac, pMac->scan.countryCodeDefault,
+-                                         &regId, COUNTRY_NV);
++                                           &regId, COUNTRY_NV);
++
+     }
+     else
+     {
+-        regId = REGDOMAIN_WORLD;
++        return status;
+     }
+-
+     WDA_SetRegDomain(pMac, regId, eSIR_TRUE);
+     pMac->scan.domainIdDefault = regId;
+     pMac->scan.domainIdCurrent = pMac->scan.domainIdDefault;
+     vos_mem_copy(pMac->scan.countryCodeCurrent, pMac->scan.countryCodeDefault,
+                  WNI_CFG_COUNTRY_CODE_LEN);
+     status = csrInitGetChannels( pMac );
+-
+     return status;
+ }
+ 
+diff --git a/CORE/SME/src/sme_common/sme_Api.c b/CORE/SME/src/sme_common/sme_Api.c
+index c4dc7b8..be1bdcf 100644
+--- a/CORE/SME/src/sme_common/sme_Api.c
++++ b/CORE/SME/src/sme_common/sme_Api.c
+@@ -5026,6 +5026,34 @@ eHalStatus sme_InitChannels(tHalHandle hHal)
+     return status;
+ }
+ 
++/*-------------------------------------------------------------------------
++    \fn sme_InitChannelsForCC
++
++    \brief Used to issue regulatory hint to user
++
++    \param hHal - global pMac structure
++
++    \return eHalStatus  SUCCESS.
++
++                         FAILURE or RESOURCES  The API finished and failed.
++--------------------------------------------------------------------------*/
++
++eHalStatus sme_InitChannelsForCC(tHalHandle hHal)
++{
++    eHalStatus          status = eHAL_STATUS_FAILURE;
++    tpAniSirGlobal      pMac = PMAC_STRUCT(hHal);
++
++    if (NULL == pMac)
++    {
++        VOS_TRACE(VOS_MODULE_ID_SME, VOS_TRACE_LEVEL_FATAL,
++            "%s: pMac is null", __func__);
++        return status;
++    }
++    status = csrInitChannelsForCC(pMac);
++
++    return status;
++}
++
+ /* ---------------------------------------------------------------------------
+ 
+     \fn sme_DHCPStartInd
+-- 
+1.8.2.1
+

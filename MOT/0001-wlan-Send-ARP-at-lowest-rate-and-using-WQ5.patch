@@ -1,0 +1,192 @@
+From 1850b4547ecff267a8435d42f8f1259516f8b7e0 Mon Sep 17 00:00:00 2001
+From: Abhishek Singh <absingh@qti.qualcomm.com>
+Date: Mon, 14 Apr 2014 10:57:08 +0530
+Subject: [PATCH] wlan: Send ARP at lowest rate and using WQ5
+
+ARP are sent on last RA data rate.
+
+Instead send ARP at lowest phy rate and use WQ5.
+
+Change-Id: Ic7cda54579a83cc0c7e407f56852cb63f29a347f
+CRs-Fixed: 646276
+---
+ CORE/HDD/inc/wlan_hdd_tx_rx.h      |  2 ++
+ CORE/HDD/src/wlan_hdd_tx_rx.c      | 42 +++++++++++++++++++++++++++++++++++---
+ CORE/TL/inc/wlan_qct_tl.h          |  2 ++
+ CORE/TL/src/wlan_qct_tl.c          |  6 ++++++
+ CORE/WDA/inc/legacy/wlan_qct_hal.h |  3 +++
+ CORE/WDI/CP/inc/wlan_qct_wdi_dp.h  |  1 +
+ CORE/WDI/CP/src/wlan_qct_wdi_dp.c  |  6 ++++++
+ 7 files changed, 59 insertions(+), 3 deletions(-)
+
+diff --git a/CORE/HDD/inc/wlan_hdd_tx_rx.h b/CORE/HDD/inc/wlan_hdd_tx_rx.h
+index b0f1541..33e2161 100644
+--- a/CORE/HDD/inc/wlan_hdd_tx_rx.h
++++ b/CORE/HDD/inc/wlan_hdd_tx_rx.h
+@@ -66,6 +66,8 @@
+ #ifdef FEATURE_WLAN_WAPI
+ #define HDD_ETHERTYPE_WAI                  ( 0x88b4 )
+ #endif
++#define HDD_ETHERTYPE_ARP                  ( 0x0806 )
++#define HDD_ETHERTYPE_ARP_SIZE               42
+ 
+ #define HDD_80211_HEADER_LEN      24
+ #define HDD_80211_HEADER_QOS_CTL  2
+diff --git a/CORE/HDD/src/wlan_hdd_tx_rx.c b/CORE/HDD/src/wlan_hdd_tx_rx.c
+index 12173e3..40209ba 100644
+--- a/CORE/HDD/src/wlan_hdd_tx_rx.c
++++ b/CORE/HDD/src/wlan_hdd_tx_rx.c
+@@ -872,9 +872,10 @@ v_BOOL_t hdd_IsEAPOLPacket( vos_pkt_t *pVosPacket )
+     
+     vosStatus = vos_pkt_peek_data( pVosPacket, (v_SIZE_t)HDD_ETHERTYPE_802_1_X_FRAME_OFFSET,
+                           &pBuffer, HDD_ETHERTYPE_802_1_X_SIZE );
+-    if (VOS_IS_STATUS_SUCCESS( vosStatus ) )
++    if ( VOS_IS_STATUS_SUCCESS( vosStatus ) )
+     {
+-       if ( vos_be16_to_cpu( *(unsigned short*)pBuffer ) == HDD_ETHERTYPE_802_1_X )
++       if ( pBuffer && *(unsigned short*)pBuffer ==
++                             vos_cpu_to_be16(HDD_ETHERTYPE_802_1_X) )
+        {
+           fEAPOL = VOS_TRUE;
+        }
+@@ -883,6 +884,35 @@ v_BOOL_t hdd_IsEAPOLPacket( vos_pkt_t *pVosPacket )
+    return fEAPOL;
+ }
+ 
++/**============================================================================
++  @brief hdd_IsARP() - Checks the packet is ARP or not.
++
++  @param pVosPacket : [in] pointer to vos packet
++  @return         : VOS_TRUE if the packet is ARP
++                  : VOS_FALSE otherwise
++  ===========================================================================*/
++
++v_BOOL_t hdd_IsARP( vos_pkt_t *pVosPacket )
++{
++    VOS_STATUS vosStatus  = VOS_STATUS_SUCCESS;
++    v_BOOL_t   fIsARP     = VOS_FALSE;
++    void       *pBuffer   = NULL;
++
++
++    vosStatus = vos_pkt_peek_data( pVosPacket,
++                           (v_SIZE_t)HDD_ETHERTYPE_802_1_X_FRAME_OFFSET,
++                          &pBuffer, HDD_ETHERTYPE_802_1_X_SIZE );
++    if ( VOS_IS_STATUS_SUCCESS( vosStatus ) )
++    {
++       if ( pBuffer && *(unsigned short*)pBuffer ==
++                                 vos_cpu_to_be16(HDD_ETHERTYPE_ARP) )
++       {
++          fIsARP = VOS_TRUE;
++       }
++    }
++
++   return fIsARP;
++}
+ 
+ #ifdef FEATURE_WLAN_WAPI // Need to update this function
+ /**============================================================================
+@@ -905,7 +935,8 @@ v_BOOL_t hdd_IsWAIPacket( vos_pkt_t *pVosPacket )
+ 
+     if (VOS_IS_STATUS_SUCCESS( vosStatus ) )
+     {
+-       if ( vos_be16_to_cpu( *(unsigned short*)pBuffer ) == HDD_ETHERTYPE_WAI)
++       if ( pBuffer && *(unsigned short*)pBuffer ==
++                               vos_cpu_to_be16(HDD_ETHERTYPE_WAI) )
+        {
+           fIsWAI = VOS_TRUE;
+        }
+@@ -1009,6 +1040,7 @@ VOS_STATUS hdd_tx_fetch_packet_cbk( v_VOID_t *vosContext,
+    v_TIME_t timestamp;
+    WLANTL_ACEnumType newAc;
+    v_SIZE_t size = 0;
++   v_U16_t packet_size;
+    tANI_U8   acAdmitted, i;
+ 
+    //Sanity check on inputs
+@@ -1188,6 +1220,10 @@ VOS_STATUS hdd_tx_fetch_packet_cbk( v_VOID_t *vosContext,
+    else 
+       pPktMetaInfo->ucIsEapol = hdd_IsEAPOLPacket( pVosPacket ) ? 1 : 0;
+ 
++   vos_pkt_get_packet_length( pVosPacket,&packet_size );
++   if( HDD_ETHERTYPE_ARP_SIZE == packet_size )
++      pPktMetaInfo->ucIsArp = hdd_IsARP( pVosPacket ) ? 1 : 0;
++
+ #ifdef FEATURE_WLAN_WAPI
+    // Override usIsEapol value when its zero for WAPI case
+       pPktMetaInfo->ucIsWai = hdd_IsWAIPacket( pVosPacket ) ? 1 : 0;
+diff --git a/CORE/TL/inc/wlan_qct_tl.h b/CORE/TL/inc/wlan_qct_tl.h
+index d7307ea..4964079 100644
+--- a/CORE/TL/inc/wlan_qct_tl.h
++++ b/CORE/TL/inc/wlan_qct_tl.h
+@@ -430,6 +430,8 @@ typedef struct
+ 
+   /* STA has more packets to send */
+   v_BOOL_t  bMorePackets;
++  /* notifying TL if this is an ARP frame or not */
++  v_U8_t    ucIsArp;
+ }WLANTL_MetaInfoType;
+ 
+ /*---------------------------------------------------------------------------
+diff --git a/CORE/TL/src/wlan_qct_tl.c b/CORE/TL/src/wlan_qct_tl.c
+index 747ab79..d7728f2 100644
+--- a/CORE/TL/src/wlan_qct_tl.c
++++ b/CORE/TL/src/wlan_qct_tl.c
+@@ -7360,6 +7360,12 @@ WLANTL_STATxAuth
+     ucTxFlag = ucTxFlag | HAL_TDLS_PEER_STA_MASK;
+   }
+ #endif /* FEATURE_WLAN_TDLS */
++  if( tlMetaInfo.ucIsArp )
++  {
++    /*Send ARP at lowest Phy rate and through WQ5 */
++    ucTxFlag |= HAL_USE_BD_RATE_MASK;
++    ucTxFlag |= HAL_USE_FW_IN_TX_PATH;
++  }
+ 
+   vosStatus = (VOS_STATUS)WDA_DS_BuildTxPacketInfo( pvosGCtx, 
+                      vosDataBuff , &vDestMacAddr,
+diff --git a/CORE/WDA/inc/legacy/wlan_qct_hal.h b/CORE/WDA/inc/legacy/wlan_qct_hal.h
+index 4fd8f95..399cbb4 100644
+--- a/CORE/WDA/inc/legacy/wlan_qct_hal.h
++++ b/CORE/WDA/inc/legacy/wlan_qct_hal.h
+@@ -349,6 +349,9 @@ tANI_U8 WLANHAL_RxBD_GetFrameTypeSubType(v_PVOID_t _pvBDHeader, tANI_U16 usFrmCt
+ #ifdef FEATURE_WLAN_TDLS
+ #define HAL_TDLS_PEER_STA_MASK              0x80 //bit 7 set for TDLS peer station 
+ #endif
++
++#define HAL_USE_BD_RATE_MASK                0x1000
++#define HAL_USE_FW_IN_TX_PATH               0x200 //bit 9 to send via WQ5
+ /*==========================================================================
+ 
+   FUNCTION    WLANHAL_FillTxBd
+diff --git a/CORE/WDI/CP/inc/wlan_qct_wdi_dp.h b/CORE/WDI/CP/inc/wlan_qct_wdi_dp.h
+index 20bb263..88830e3 100644
+--- a/CORE/WDI/CP/inc/wlan_qct_wdi_dp.h
++++ b/CORE/WDI/CP/inc/wlan_qct_wdi_dp.h
+@@ -129,6 +129,7 @@ when        who    what, where, why
+ 
+ #define WDI_USE_BD_RATE2_FOR_MANAGEMENT_FRAME 0x40 // Bit 6 will be used to control BD rate for Management frames
+ 
++#define WDI_USE_BD_RATE_MASK              0x1000
+ 
+ /*Macro for getting the size of the TX BD*/
+ #define WDI_TX_BD_HEADER_SIZE        sizeof(WDI_TxBdType)
+diff --git a/CORE/WDI/CP/src/wlan_qct_wdi_dp.c b/CORE/WDI/CP/src/wlan_qct_wdi_dp.c
+index a58d0b9..ea7ae67 100644
+--- a/CORE/WDI/CP/src/wlan_qct_wdi_dp.c
++++ b/CORE/WDI/CP/src/wlan_qct_wdi_dp.c
+@@ -552,6 +552,12 @@ WDI_FillTxBd
+            pBd->bdRate = WDI_BDRATE_CTRL_FRAME;
+         }
+ #endif
++
++        if(ucTxFlag & WDI_USE_BD_RATE_MASK)
++        {
++            pBd->bdRate = WDI_BDRATE_BCDATA_FRAME;
++        }
++
+         pBd->rmf    = WDI_RMF_DISABLED;     
+ 
+         /* sanity: Might already be set by caller, but enforce it here again */
+-- 
+1.8.2.1
+
