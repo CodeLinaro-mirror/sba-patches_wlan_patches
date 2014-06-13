@@ -1,0 +1,71 @@
+diff --git a/arch/arm/boot/dts/imx6dl.dtsi b/arch/arm/boot/dts/imx6dl.dtsi
+index e9b415f..9765a93 100644
+--- a/arch/arm/boot/dts/imx6dl.dtsi
++++ b/arch/arm/boot/dts/imx6dl.dtsi
+@@ -500,6 +500,17 @@
+ 						>;
+ 					};
+ 				};
++				
++				uart3 {
++                                        pinctrl_uart3_1: uart3grp-1 {
++                                                fsl,pins = <
++                                                        MX6DL_PAD_SD4_CLK__UART3_RX_DATA 0x1b0b1
++                                                        MX6DL_PAD_SD4_CMD__UART3_TX_DATA 0x1b0b1
++                                                        MX6DL_PAD_EIM_D30__UART3_CTS_B   0x1b0b1
++                                                        MX6DL_PAD_EIM_EB3__UART3_RTS_B   0x1b0b1
++                                                >;
++                                        };
++                                };
+ 
+ 				uart4 {
+ 					pinctrl_uart4_1: uart4grp-1 {
+diff --git a/arch/arm/boot/dts/imx6q.dtsi b/arch/arm/boot/dts/imx6q.dtsi
+index 4e99706..613f9d8 100644
+--- a/arch/arm/boot/dts/imx6q.dtsi
++++ b/arch/arm/boot/dts/imx6q.dtsi
+@@ -474,7 +474,16 @@
+ 						>;
+ 					};
+ 				};
+-
++				uart3 {
++                			pinctrl_uart3_1: uart3grp-1 {
++                        			fsl,pins = <
++                                			MX6Q_PAD_SD4_CLK__UART3_RX_DATA 0x1b0b1
++			                                MX6Q_PAD_SD4_CMD__UART3_TX_DATA 0x1b0b1
++                        			        MX6Q_PAD_EIM_D30__UART3_CTS_B   0x1b0b1
++			                                MX6Q_PAD_EIM_EB3__UART3_RTS_B   0x1b0b1
++                        			>;
++                			};
++        			};
+ 				uart4 {
+ 					pinctrl_uart4_1: uart4grp-1 {
+ 						fsl,pins = <
+diff --git a/arch/arm/boot/dts/imx6qdl-sabreauto.dtsi b/arch/arm/boot/dts/imx6qdl-sabreauto.dtsi
+index 850b84e..3610ca5 100644
+--- a/arch/arm/boot/dts/imx6qdl-sabreauto.dtsi
++++ b/arch/arm/boot/dts/imx6qdl-sabreauto.dtsi
+@@ -198,6 +198,14 @@
+ 					};
+ 				};
+ 			};
++			uart3: serial@021ec000 {
++				pinctrl-names = "default";
++				pinctrl-0 = <&pinctrl_uart3_1>;
++				pinctrl-assert-gpios = <&max7310_2 4 0>, /* CTS */
++			       	<&max7310_3 3 0>; /* RXD and TXD */
++				fsl,uart-has-rtscts;
++				status = "okay";
++			};
+ 
+ 			uart4: serial@021f0000 {
+ 				pinctrl-names = "default";
+@@ -210,7 +218,6 @@
+ 				pinctrl-0 = <&pinctrl_audmux_3>;
+ 				status = "okay";
+ 			};
+-
+ 			i2c@021a4000 { /* I2C2 */
+                                 status = "okay";
+                                 clock-frequency = <100000>;
