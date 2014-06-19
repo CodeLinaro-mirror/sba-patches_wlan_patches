@@ -1,0 +1,40 @@
+/*
+  * Copyright (c) 2014 Linux Foundation
+  * All Rights Reserved.
+  * Qualcomm Atheros Confidential and Proprietary.
+  */
+
+diff --git a/CORE/VOSS/src/vos_sched.c b/CORE/VOSS/src/vos_sched.c
+index 3abb656..b3970f9 100644
+--- a/CORE/VOSS/src/vos_sched.c
++++ b/CORE/VOSS/src/vos_sched.c
+@@ -985,7 +985,7 @@ static int VosTXThread ( void * Arg )
+ 
+   set_user_nice(current, -1);
+ 
+-#ifdef WLAN_FEATURE_11AC_HIGH_TP
++#if defined(WLAN_FEATURE_11AC_HIGH_TP) && defined (MSM_PLATFORM)
+   set_wake_up_idle(true);
+ #endif
+ 
+@@ -1184,7 +1184,7 @@ static int VosRXThread ( void * Arg )
+ 
+   set_user_nice(current, -1);
+ 
+-#ifdef WLAN_FEATURE_11AC_HIGH_TP
++#if defined(WLAN_FEATURE_11AC_HIGH_TP) && defined (MSM_PLATFORM)
+   set_wake_up_idle(true);
+ #endif
+ 
+diff --git a/Kbuild b/Kbuild
+index 20be59f..92ce262 100644
+--- a/Kbuild
++++ b/Kbuild
+@@ -939,7 +939,6 @@ CDEFINES :=	-DANI_LITTLE_BYTE_ENDIAN \
+ 		-DWLAN_PERF \
+ 		-DPTT_SOCK_SVC_ENABLE \
+ 		-Wall\
+-		-Werror\
+ 		-D__linux__ \
+ 		-DHAL_SELF_STA_PER_BSS=1 \
+ 		-DWLAN_FEATURE_VOWIFI_11R \
