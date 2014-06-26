@@ -1,0 +1,110 @@
+/*
+* Copyright (c) 2014 Linux Foundation
+* All Rights Reserved.
+* Qualcomm Atheros Confidential and Proprietary.
+*/
+
+diff --git a/CORE/HDD/src/wlan_hdd_ftm.c b/CORE/HDD/src/wlan_hdd_ftm.c
+index 14d9718..2c88992 100644
+--- a/CORE/HDD/src/wlan_hdd_ftm.c
++++ b/CORE/HDD/src/wlan_hdd_ftm.c
+@@ -521,7 +521,7 @@ static FTM_STATUS ftm_status;
+ static tPttMsgbuffer *pMsgBuf;
+ 
+ #if defined(QCA_WIFI_2_0) && !defined(QCA_WIFI_ISOC) && defined(QCA_WIFI_FTM)
+-#if defined(HIF_USB)
++#if (defined(HIF_USB) || defined(HIF_SDIO))
+ #define ATH_XIOCTL_UNIFIED_UTF_CMD  0x1000
+ #define ATH_XIOCTL_UNIFIED_UTF_RSP  0x1001
+ #define MAX_UTF_LENGTH              1024
+@@ -1666,7 +1666,7 @@ int wlan_hdd_ftm_close(hdd_context_t *pHddCtx)
+     kfree(pHddCtx->cfg_ini);
+     pHddCtx->cfg_ini= NULL;
+ 
+-#if defined(QCA_WIFI_FTM) && defined(HIF_USB)
++#if defined(QCA_WIFI_FTM) && ( defined(HIF_USB) || defined(HIF_SDIO))
+     spin_lock_bh(&qcmbr_queue_lock);
+     if (!list_empty(&qcmbr_queue_head)) {
+         qcmbr_queue_t *msg_buf, *tmp_buf;
+@@ -5526,7 +5526,7 @@ static int wlan_ftm_register_wext(hdd_adapter_t *pAdapter)
+ }
+ 
+ #if defined(QCA_WIFI_2_0) && !defined(QCA_WIFI_ISOC) && defined(QCA_WIFI_FTM)
+-#if defined(HIF_USB)
++#if ( defined(HIF_USB) || defined(HIF_SDIO))
+ int wlan_hdd_qcmbr_command(hdd_adapter_t *pAdapter, qcmbr_data_t *pqcmbr_data)
+ {
+     int ret = 0;
+@@ -5672,7 +5672,7 @@ VOS_STATUS WLANFTM_McProcessMsg (v_VOID_t *message)
+     data_len = *((u_int32_t *)message);
+     data = (u_int32_t *)message + 1;
+ 
+-#if defined(HIF_USB)
++#if ( defined(HIF_USB) || defined(HIF_SDIO))
+     WLANQCMBR_McProcessMsg(message);
+ #else
+ #ifdef CONFIG_NL80211_TESTMODE
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index 082e2cc..c76e221 100755
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -134,6 +134,7 @@ void hdd_ch_avoid_cb(void *hdd_context,void *indi_param);
+ #include "if_usb.h"
+ #define SIOCIOCTLTX99 (SIOCDEVPRIVATE+13)
+ #elif defined(HIF_SDIO)
++#define SIOCIOCTLTX99 (SIOCDEVPRIVATE+13)
+ #include "if_ath_sdio.h"
+ #endif
+ #include "wma.h"
+@@ -5523,7 +5524,7 @@ int hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+       goto exit;
+    }
+ 
+-#if defined(QCA_WIFI_2_0) && !defined(QCA_WIFI_ISOC) && defined(QCA_WIFI_FTM) && defined(HIF_USB)
++#if defined(QCA_WIFI_2_0) && !defined(QCA_WIFI_ISOC) && defined(QCA_WIFI_FTM) && ( defined(HIF_USB) || defined(HIF_SDIO))
+    if (VOS_FTM_MODE == hdd_get_conparam()) {
+        if (SIOCIOCTLTX99 == cmd) {
+            ret = wlan_hdd_qcmbr_unified_ioctl(pAdapter, ifr);
+@@ -11182,7 +11183,7 @@ int hdd_wlan_startup(struct device *dev, v_VOID_t *hif_sc)
+    /*
+     * cfg80211: Initialization  ...
+     */
+-#if !defined(HIF_USB)
++#if !(defined(HIF_USB) || defined(HIF_SDIO))
+    if (VOS_FTM_MODE != hdd_get_conparam())
+ #endif
+    {
+diff --git a/CORE/VOSS/src/vos_sched.c b/CORE/VOSS/src/vos_sched.c
+index fd2685e..801703c 100644
+--- a/CORE/VOSS/src/vos_sched.c
++++ b/CORE/VOSS/src/vos_sched.c
+@@ -985,7 +985,7 @@ static int VosTXThread ( void * Arg )
+ 
+   set_user_nice(current, -1);
+ 
+-#ifdef WLAN_FEATURE_11AC_HIGH_TP
++#if defined(WLAN_FEATURE_11AC_HIGH_TP) && defined (MSM_PLATFORM)
+   set_wake_up_idle(true);
+ #endif
+ 
+@@ -1184,7 +1184,7 @@ static int VosRXThread ( void * Arg )
+ 
+   set_user_nice(current, -1);
+ 
+-#ifdef WLAN_FEATURE_11AC_HIGH_TP
++#if defined(WLAN_FEATURE_11AC_HIGH_TP) && defined (MSM_PLATFORM)
+   set_wake_up_idle(true);
+ #endif
+ 
+diff --git a/Kbuild b/Kbuild
+index aaf3eaf..bdd17a1 100644
+--- a/Kbuild
++++ b/Kbuild
+@@ -956,7 +956,6 @@ CDEFINES :=	-DANI_LITTLE_BYTE_ENDIAN \
+ 		-DWLAN_PERF \
+ 		-DPTT_SOCK_SVC_ENABLE \
+ 		-Wall\
+-		-Werror\
+ 		-D__linux__ \
+ 		-DHAL_SELF_STA_PER_BSS=1 \
+ 		-DWLAN_FEATURE_VOWIFI_11R \

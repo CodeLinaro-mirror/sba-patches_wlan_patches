@@ -1,0 +1,80 @@
+/*
+* Copyright (c) 2014 Linux Foundation
+* All Rights Reserved.
+* Qualcomm Atheros Confidential and Proprietary.
+*/
+
+From c1669db6a4fde8ad38cde6b81a78b73a41159b91 Mon Sep 17 00:00:00 2001
+From: Louis Hsieh <lhsieh@qca.qualcomm.com>
+Date: Mon, 23 Jun 2014 10:39:58 +0800
+Subject: [PATCH] wpa_supplicant: update
+
+---
+ .../hostapd/Makefile                               |    3 +++
+ .../src/drivers/drivers.mak                        |    3 ++-
+ .../wpa_supplicant/Makefile                        |    3 +++
+ 3 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/hostapd/Makefile b/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/hostapd/Makefile
+index 89fb851..4c8d60d 100644
+--- a/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/hostapd/Makefile
++++ b/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/hostapd/Makefile
+@@ -482,6 +482,7 @@ endif
+ ifeq ($(CONFIG_TLS), openssl)
+ ifdef TLS_FUNCS
+ OBJS += ../src/crypto/tls_openssl.o
++LIBS += -L${LIBOPENSSL_TOPDIR}
+ LIBS += -lssl
+ endif
+ OBJS += ../src/crypto/crypto_openssl.o
+@@ -489,7 +490,9 @@ HOBJS += ../src/crypto/crypto_openssl.o
+ ifdef NEED_FIPS186_2_PRF
+ OBJS += ../src/crypto/fips_prf_openssl.o
+ endif
++LIBS += -L${LIBLCRYPTO_TOPDIR}
+ LIBS += -lcrypto
++LIBS_h += -L${LIBLCRYPTO_TOPDIR}
+ LIBS_h += -lcrypto
+ endif
+ 
+diff --git a/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/src/drivers/drivers.mak b/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/src/drivers/drivers.mak
+index 68ff910..048d1b9 100644
+--- a/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/src/drivers/drivers.mak
++++ b/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/src/drivers/drivers.mak
+@@ -28,9 +28,10 @@ NEED_LINUX_IOCTL=y
+ NEED_RFKILL=y
+ 
+ ifdef CONFIG_LIBNL32
++  DRV_LIBS += -L{LIBNETLINK_TOPDIR}
+   DRV_LIBS += -lnl-3
+   DRV_LIBS += -lnl-genl-3
+-  DRV_CFLAGS += -DCONFIG_LIBNL20 -I/usr/include/libnl3
++  DRV_CFLAGS += -DCONFIG_LIBNL20 -I${INCLUDE_LIBNL3_HEADER}
+ else
+   ifdef CONFIG_LIBNL_TINY
+     DRV_LIBS += -lnl-tiny
+diff --git a/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/wpa_supplicant/Makefile b/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/wpa_supplicant/Makefile
+index 680b652..f311b07 100644
+--- a/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/wpa_supplicant/Makefile
++++ b/wpa_supplicant_8-AU_LINUX_ANDROID_KK.04.04.02.010.449/wpa_supplicant/Makefile
+@@ -914,6 +914,7 @@ ifeq ($(CONFIG_TLS), openssl)
+ ifdef TLS_FUNCS
+ CFLAGS += -DEAP_TLS_OPENSSL
+ OBJS += ../src/crypto/tls_openssl.o
++LIBS += -L${LIBOPENSSL_TOPDIR}
+ LIBS += -lssl
+ endif
+ OBJS += ../src/crypto/crypto_openssl.o
+@@ -921,7 +922,9 @@ OBJS_p += ../src/crypto/crypto_openssl.o
+ ifdef NEED_FIPS186_2_PRF
+ OBJS += ../src/crypto/fips_prf_openssl.o
+ endif
++LIBS += -L${LIBLCRYPTO_TOPDIR}
+ LIBS += -lcrypto
++LIBS_p += -L${LIBLCRYPTO_TOPDIR}
+ LIBS_p += -lcrypto
+ ifdef CONFIG_TLS_ADD_DL
+ LIBS += -ldl
+-- 
+1.7.9.5
+
