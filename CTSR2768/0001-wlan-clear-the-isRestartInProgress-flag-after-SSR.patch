@@ -1,0 +1,44 @@
+From b401bfff08d57ce098e014538fb2466897de292a Mon Sep 17 00:00:00 2001
+From: Mihir Shete <smihir@qti.qualcomm.com>
+Date: Mon, 23 Jun 2014 19:07:50 +0530
+Subject: [PATCH] wlan: clear the isRestartInProgress flag after SSR
+
+isRestartInProgress has to be cleared after successful
+SSR or the driver will ignore the SSR requests coming
+through the wpalWlanReload() API.
+
+Change-Id: I5a32665b60f7b831e8550f36e0d4b764126011ac
+CRs-Fixed: 684112
+---
+ CORE/HDD/src/wlan_hdd_main.c | 2 +-
+ CORE/VOSS/src/vos_sched.c    | 1 +
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/CORE/HDD/src/wlan_hdd_main.c b/CORE/HDD/src/wlan_hdd_main.c
+index 984eb1b..99a2207 100644
+--- a/CORE/HDD/src/wlan_hdd_main.c
++++ b/CORE/HDD/src/wlan_hdd_main.c
+@@ -9145,7 +9145,7 @@ VOS_STATUS wlan_hdd_restart_driver(hdd_context_t *pHddCtx)
+    /* A tight check to make sure reentrancy */
+    if(atomic_xchg(&pHddCtx->isRestartInProgress, 1))
+    {
+-      VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_WARN, 
++      VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+             "%s: WLAN restart is already in progress", __func__);
+ 
+       return VOS_STATUS_E_ALREADY;
+diff --git a/CORE/VOSS/src/vos_sched.c b/CORE/VOSS/src/vos_sched.c
+index 70741da..66657bf 100644
+--- a/CORE/VOSS/src/vos_sched.c
++++ b/CORE/VOSS/src/vos_sched.c
+@@ -748,6 +748,7 @@ VosWDThread
+           VOS_ASSERT(0);
+           goto err_reset;
+         }
++        atomic_set(&pHddCtx->isRestartInProgress, 0);
+         pWdContext->resetInProgress = false;
+       }
+       else
+-- 
+1.8.2.1
+
