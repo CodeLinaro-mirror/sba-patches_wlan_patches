@@ -1,0 +1,35 @@
+From 59b7772b45eb90604ef4d5993326d1e0263ec661 Mon Sep 17 00:00:00 2001
+From: Manikandan Mohan <manikand@qti.qualcomm.com>
+Date: Wed, 2 Jul 2014 21:12:09 +0530
+Subject: [PATCH] qcacld: Set Proper phymode after ACS
+
+SAP phymode is initially set based on beacon IEs. But it also
+need to be updated based on channel. Hence for ACS after best
+channel is chosen phymode need to set based on it.
+
+Change-Id: Ibcb79ac7ec3984fd6e901623b2b203cf97310aa1
+CRs-fixed: 688601
+---
+ CORE/SAP/src/sapFsm.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/CORE/SAP/src/sapFsm.c b/CORE/SAP/src/sapFsm.c
+index 96cfeb6..35c68ef 100644
+--- a/CORE/SAP/src/sapFsm.c
++++ b/CORE/SAP/src/sapFsm.c
+@@ -1547,6 +1547,12 @@ sapFsm
+                              sapContext->csrRoamProfile.phyMode),
+                              sapContext->channel);
+                  }
++                 if (sapContext->channel > 14 &&
++                         (sapContext->csrRoamProfile.phyMode ==
++                         eSAP_DOT11_MODE_11g ||
++                         sapContext->csrRoamProfile.phyMode ==
++                         eSAP_DOT11_MODE_11g_ONLY))
++                     sapContext->csrRoamProfile.phyMode = eSAP_DOT11_MODE_11a;
+ 
+                  /* Transition from eSAP_CH_SELECT to eSAP_STARTING (both without substates) */
+                  VOS_TRACE( VOS_MODULE_ID_SAP, VOS_TRACE_LEVEL_INFO_HIGH, "In %s, from state %s => %s",
+-- 
+1.8.2.1
+
